@@ -1,0 +1,8 @@
+# Temporary/editor files
+*.tmp
+*.bak
+*.log
+
+# Test artifacts
+Dummy/
+test-output/

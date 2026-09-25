@@ -54,6 +54,29 @@ function Write-Field {
     Write-Host $Value
 }
 
+# Decides what a single answer to the cleanup confirmation means.
+# Deliberately total and side-effect free: only a literal Y/y can ever
+# authorise the destructive action, so stray or buffered keystrokes - including
+# a bare Enter - can never be read as consent.
+function Get-PMConfirmDecision {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Answer
+    )
+
+    # Enter, or anything with no non-whitespace content, is not consent.
+    if ($null -eq $Answer) { return 'RETRY' }
+    $normalized = $Answer.Trim()
+    if ($normalized.Length -eq 0) { return 'RETRY' }
+
+    if ($normalized -ceq 'Y' -or $normalized -ceq 'y') { return 'PROCEED' }
+    if ($normalized -ceq 'N' -or $normalized -ceq 'n') { return 'ABORT' }
+
+    # Anything else is invalid input: re-prompt, never assume consent.
+    return 'RETRY'
+}
+
 # ============================================
 # HEADER
 # ============================================
@@ -222,20 +245,31 @@ if ($cleanupEst) {
 
     if ($cleanupEst.SkippedCount -gt 0) {
         Write-Host ""
-        Write-Host "  Recycle Bin: $($cleanupEst.SkippedCount) items will be SKIPPED (non-TEMP source)" -ForegroundColor DarkGray
+        Write-Host "  Recycle Bin: $($cleanupEst.SkippedCount) non-TEMP items will be left untouched." -ForegroundColor DarkGray
     }
 } else {
     Write-Field 'Cleanup' 'N/A - Could not estimate'
 }
 
-# Ask for confirmation
-Write-Host ""
-Write-Host "  Proceed with cleanup? (Y/N): " -NoNewline -ForegroundColor Yellow
-$confirm = Read-Host
+# Ask for confirmation. Only an explicit Y or y may cross this gate; Enter,
+# whitespace and any other input re-prompt instead of defaulting to cleanup.
+$runCleanup = $false
+while ($true) {
+    Write-Host "  Proceed with cleanup? [Y/N]: " -NoNewline -ForegroundColor Yellow
+    $decision = Get-PMConfirmDecision -Answer (Read-Host)
 
-if ($confirm -eq 'Y' -or $confirm -eq 'y') {
+    if ($decision -eq 'PROCEED') { $runCleanup = $true; break }
+    if ($decision -eq 'ABORT')  { $runCleanup = $false; break }
+
+    Write-Host "  Please enter Y or N." -ForegroundColor Yellow
+}
+
+if ($runCleanup) {
     Write-Host ""
     Write-Host "  Running cleanup..." -ForegroundColor DarkGray
+    Write-Field 'User TEMP'    'Cleaning...'
+    Write-Field 'Windows TEMP' 'Cleaning...'
+    Write-Field 'Recycle Bin'  'Cleaning...'
 
     $cleanupResult = $null
     $cleanupError = $null

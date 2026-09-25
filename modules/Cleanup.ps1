@@ -343,20 +343,48 @@ function Format-PMCleanupReport {
     # warnings only restate the real exception text; no reason is inferred,
     # because the recycle and purge APIs cannot reliably tell a locked file
     # apart from an access-denied or shell failure.
+    # Per-stage counts come from the authoritative per-stage Skipped counters,
+    # so the summary stays correct even when the note list is capped at 15.
+    # The number of listed notes is used as a floor, so an older or synthetic
+    # result object that carries notes but no counters still summarises.
+    # No failure reason is categorised or invented here: the per-file detail
+    # lines below carry the real exception text.
     $warnList = @(Get-PMReportValue -InputObject $Result -Name 'Warnings' -Default @())
     if ($warnList.Count -gt 0) {
         $rows.Add(@('SECTION', 'WARNINGS'))
+
+        $stageOrder = @(
+            @{ Label = 'User TEMP';    Counter = 'UserTempFilesSkipped' },
+            @{ Label = 'Windows TEMP'; Counter = 'WinTempFilesSkipped' },
+            @{ Label = 'Recycle Bin';  Counter = 'RecycleSkipped' }
+        )
+
+        foreach ($stage in $stageOrder) {
+            $prefix = '[WARN] ' + $stage.Label + ':'
+            $listedCount = 0
+            foreach ($w in $warnList) {
+                if (([string]$w).StartsWith($prefix, [System.StringComparison]::Ordinal)) { $listedCount++ }
+            }
+            $counterValue = [int](Get-PMReportValue -InputObject $Result -Name $stage.Counter -Default 0)
+            $total = [Math]::Max($counterValue, $listedCount)
+            if ($total -gt 0) {
+                $rows.Add(@('FIELD', $stage.Label, "$total file(s) left untouched."))
+            }
+        }
+
+        $rows.Add(@('DETAILHEAD', 'Details:'))
         foreach ($w in $warnList) { $rows.Add(@('WARN', [string]$w)) }
     }
 
     $out = New-Object System.Collections.Generic.List[string]
     foreach ($row in $rows) {
         switch ($row[0]) {
-            'TITLE'    { $out.Add($row[1]) }
-            'SUBTITLE' { $out.Add(('  ' + $row[1])) }
-            'SECTION'  { $out.Add(''); $out.Add($row[1]) }
-            'FIELD'    { $out.Add(('  {0,-18}: {1}' -f $row[1], $row[2])) }
-            'WARN'     { $out.Add(('  ' + $row[1])) }
+            'TITLE'      { $out.Add($row[1]) }
+            'SUBTITLE'   { $out.Add(('  ' + $row[1])) }
+            'SECTION'    { $out.Add(''); $out.Add($row[1]) }
+            'FIELD'      { $out.Add(('  {0,-18}: {1}' -f $row[1], $row[2])) }
+            'DETAILHEAD' { $out.Add(''); $out.Add(('    ' + $row[1])) }
+            'WARN'       { $out.Add(('    ' + $row[1])) }
         }
     }
 
@@ -451,7 +479,7 @@ function Invoke-PMCleanup {
                     $warningTotal++
                     if ($warnings.Count -lt $warnLimit) {
                         $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                        $warnings.Add("[WARN] User TEMP: could not recycle '$($file.Name)' - left untouched. $reason")
+                        $warnings.Add("[WARN] User TEMP: '$($file.Name)' - $reason")
                     }
                 }
             }
@@ -503,7 +531,7 @@ function Invoke-PMCleanup {
                     $warningTotal++
                     if ($warnings.Count -lt $warnLimit) {
                         $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                        $warnings.Add("[WARN] Windows TEMP: could not recycle '$($file.Name)' - left untouched. $reason")
+                        $warnings.Add("[WARN] Windows TEMP: '$($file.Name)' - $reason")
                     }
                 }
             }
@@ -542,7 +570,7 @@ function Invoke-PMCleanup {
                 $warningTotal++
                 if ($warnings.Count -lt $warnLimit) {
                     $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                    $warnings.Add("[WARN] Recycle Bin: could not purge TEMP-origin item '$($item.Name)' - left untouched. $reason")
+                        $warnings.Add("[WARN] Recycle Bin: '$($item.Name)' - $reason")
                 }
             }
         }

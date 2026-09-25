@@ -238,7 +238,8 @@ if ($confirm -eq 'Y' -or $confirm -eq 'y') {
     Write-Host "  Running cleanup..." -ForegroundColor DarkGray
 
     $cleanupResult = $null
-    try { $cleanupResult = Invoke-PMCleanup } catch {}
+    $cleanupError = $null
+    try { $cleanupResult = Invoke-PMCleanup } catch { $cleanupError = $_ }
 
     if ($cleanupResult) {
         Write-Host ""
@@ -246,8 +247,11 @@ if ($confirm -eq 'Y' -or $confirm -eq 'y') {
         Write-Field 'Windows TEMP'  $cleanupResult.WinTempCleaned
         Write-Field 'Recycle Bin'   $cleanupResult.RecycleCleaned
 
+        # Legacy counter: covers locked files, failed recycles and failed purges
+        # alike, so it is not reported as "locked" specifically. The per-stage
+        # breakdown below is the authoritative detail.
         if ($cleanupResult.FilesSkipped -gt 0) {
-            Write-Field 'Skipped (locked)' "$($cleanupResult.FilesSkipped) files"
+            Write-Field 'Skipped / Failed' "$($cleanupResult.FilesSkipped) items"
         }
         if ($cleanupResult.TempFilesSkipped -gt 0) {
             Write-Field 'Skipped (non-TEMP)' "$($cleanupResult.TempFilesSkipped) items"
@@ -261,6 +265,9 @@ if ($confirm -eq 'Y' -or $confirm -eq 'y') {
         } catch {}
     } else {
         Write-Host "  Cleanup failed or was interrupted." -ForegroundColor Red
+        if ($cleanupError) {
+            Write-Host "  Reason: $($cleanupError.Exception.Message)" -ForegroundColor Red
+        }
     }
 } else {
     Write-Host ""

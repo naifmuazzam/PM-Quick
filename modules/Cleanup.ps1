@@ -282,7 +282,8 @@ function Get-PMReportValue {
         [Parameter(Mandatory, Position = 1)]
         [string]$Name,
 
-        [string]$Default = 'n/a'
+        [AllowEmptyCollection()]
+        [object]$Default = 'n/a'
     )
 
     if ($null -eq $InputObject) { return $Default }
@@ -304,7 +305,10 @@ function Format-PMCleanupReport {
 
     # Rows are collected first, then rendered, so ordering stays declarative.
     $rows = New-Object System.Collections.Generic.List[object]
-    $rows.Add(@('TITLE', '=== PM CLEANUP ==='))
+    $rows.Add(@('TITLE', $(if ($dryRun) { '=== PM CLEANUP (DRY RUN) ===' } else { '=== PM CLEANUP ===' })))
+    if ($dryRun) {
+        $rows.Add(@('SUBTITLE', 'No files were recycled or permanently deleted.'))
+    }
 
     $rows.Add(@('SECTION', 'USER TEMP'))
     $rows.Add(@('FIELD', 'Files found', (Get-PMReportValue -InputObject $Result -Name 'UserTempFilesFound' -Default 0)))
@@ -329,23 +333,30 @@ function Format-PMCleanupReport {
     # it can never be read as, or folded into, the TEMP skip counters.
     $leftAlone = Get-PMReportValue -InputObject $Result -Name 'TempFilesSkipped' -Default 0
     if ($leftAlone -gt 0) {
-        $rows.Add(@('FIELD', 'left untouched', "$leftAlone (non-TEMP source)"))
+        $rows.Add(@('FIELD', 'Left untouched', "$leftAlone (non-TEMP source)"))
     }
 
     $rows.Add(@('SECTION', 'RESULT'))
     $rows.Add(@('FIELD', 'Total cleaned', (Format-PMByteSize (Get-PMReportValue -InputObject $Result -Name 'TotalCleaned' -Default 0))))
 
-    if ($dryRun) {
-        $rows.Add(@('NOTE', '  (dry run - nothing was deleted, recycled or purged)'))
+    # Per-stage Skipped counters above are the authoritative skip figures. The
+    # warnings only restate the real exception text; no reason is inferred,
+    # because the recycle and purge APIs cannot reliably tell a locked file
+    # apart from an access-denied or shell failure.
+    $warnList = @(Get-PMReportValue -InputObject $Result -Name 'Warnings' -Default @())
+    if ($warnList.Count -gt 0) {
+        $rows.Add(@('SECTION', 'WARNINGS'))
+        foreach ($w in $warnList) { $rows.Add(@('WARN', [string]$w)) }
     }
 
     $out = New-Object System.Collections.Generic.List[string]
     foreach ($row in $rows) {
         switch ($row[0]) {
-            'TITLE'   { $out.Add($row[1]) }
-            'SECTION' { $out.Add(''); $out.Add($row[1]) }
-            'FIELD'   { $out.Add(('  {0,-18}: {1}' -f $row[1], $row[2])) }
-            'NOTE'    { $out.Add(''); $out.Add($row[1]) }
+            'TITLE'    { $out.Add($row[1]) }
+            'SUBTITLE' { $out.Add(('  ' + $row[1])) }
+            'SECTION'  { $out.Add(''); $out.Add($row[1]) }
+            'FIELD'    { $out.Add(('  {0,-18}: {1}' -f $row[1], $row[2])) }
+            'WARN'     { $out.Add(('  ' + $row[1])) }
         }
     }
 
@@ -389,6 +400,10 @@ function Invoke-PMCleanup {
 
         TotalCleaned = 0
         DryRun       = [bool]$DryRun
+
+        # Capped, human-readable failure notes. Text is the real exception
+        # message; no failure reason is inferred or invented.
+        Warnings = @()
     }
 
     $totalCleaned = 0
@@ -402,6 +417,13 @@ function Invoke-PMCleanup {
     [long]$uBefore = 0; [long]$uAfter = 0
     [long]$wBefore = 0; [long]$wAfter = 0
     [long]$rbOriginFound = 0; [long]$rbPurged = 0; [long]$rbPurgeFailed = 0
+
+    # Keep console output bounded: at most $warnLimit notes are kept verbatim,
+    # the rest are summarised as a count. Every failure still increments the
+    # real counters regardless of whether its text is kept.
+    $warnings = New-Object System.Collections.Generic.List[string]
+    [long]$warningTotal = 0
+    $warnLimit = 15
 
     # --- User TEMP ---
     $userTemp = $env:TEMP
@@ -426,6 +448,11 @@ function Invoke-PMCleanup {
                 } catch {
                     $skipped++
                     $uSkipped++
+                    $warningTotal++
+                    if ($warnings.Count -lt $warnLimit) {
+                        $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                        $warnings.Add("[WARN] User TEMP: could not recycle '$($file.Name)' - left untouched. $reason")
+                    }
                 }
             }
 
@@ -473,6 +500,11 @@ function Invoke-PMCleanup {
                 } catch {
                     $skipped++
                     $wSkipped++
+                    $warningTotal++
+                    if ($warnings.Count -lt $warnLimit) {
+                        $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                        $warnings.Add("[WARN] Windows TEMP: could not recycle '$($file.Name)' - left untouched. $reason")
+                    }
                 }
             }
 
@@ -507,6 +539,11 @@ function Invoke-PMCleanup {
             } catch {
                 $skipped++
                 $rbPurgeFailed++
+                $warningTotal++
+                if ($warnings.Count -lt $warnLimit) {
+                    $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                    $warnings.Add("[WARN] Recycle Bin: could not purge TEMP-origin item '$($item.Name)' - left untouched. $reason")
+                }
             }
         }
     } else {
@@ -525,6 +562,11 @@ function Invoke-PMCleanup {
     $summary.RecyclePurged          = $rbPurged
     $summary.RecycleSkipped         = $rbPurgeFailed
     $summary.TotalCleaned           = [long]$totalCleaned
+
+    if ($warningTotal -gt $warnings.Count) {
+        $warnings.Add("[WARN] ... and $($warningTotal - $warnings.Count) more failure(s) not listed.")
+    }
+    $summary.Warnings = @($warnings)
 
     [pscustomobject]$summary
 }

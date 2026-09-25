@@ -252,6 +252,13 @@ if ($confirm -eq 'Y' -or $confirm -eq 'y') {
         if ($cleanupResult.TempFilesSkipped -gt 0) {
             Write-Field 'Skipped (non-TEMP)' "$($cleanupResult.TempFilesSkipped) items"
         }
+
+        # Detailed per-location report. Purely additive: the fields above keep
+        # their original names, order and meaning.
+        try {
+            Write-Host ""
+            Format-PMCleanupReport -Result $cleanupResult | ForEach-Object { Write-Host $_ }
+        } catch {}
     } else {
         Write-Host "  Cleanup failed or was interrupted." -ForegroundColor Red
     }

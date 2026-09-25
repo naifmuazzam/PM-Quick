@@ -1,10 +1,48 @@
+function Get-TempTreeSafe {
+    [CmdletBinding()]
+    param(
+        [string]$Root
+    )
+
+    $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $dirs  = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
+
+    if ($Root -and (Test-Path -LiteralPath $Root -PathType Container -ErrorAction SilentlyContinue)) {
+        $stack = New-Object System.Collections.Generic.Stack[string]
+        $stack.Push((Resolve-Path -LiteralPath $Root -ErrorAction SilentlyContinue).ProviderPath)
+
+        while ($stack.Count -gt 0) {
+            $current = $stack.Pop()
+
+            # Non-recursive by design: descent is driven by the stack below
+            foreach ($entry in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction SilentlyContinue)) {
+                # Never traverse into or act on junctions / symlinks / other reparse points,
+                # so cleanup can never escape the intended TEMP tree.
+                if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+
+                if ($entry.PSIsContainer) {
+                    $dirs.Add($entry)
+                    $stack.Push($entry.FullName)
+                } else {
+                    $files.Add($entry)
+                }
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        Files       = $files
+        Directories = $dirs
+    }
+}
+
 function Get-DirectorySize {
     [CmdletBinding()]
     param([string]$Path)
 
     if (-not (Test-Path $Path)) { return 0 }
-    (Get-ChildItem -Path $Path -Recurse -File -Force -ErrorAction SilentlyContinue |
-        Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+    (Get-TempTreeSafe -Root $Path).Files |
+        Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue | ForEach-Object { $_.Sum }
 }
 
 function Get-TempCleanupEstimate {
@@ -56,6 +94,52 @@ function Get-TempCleanupEstimate {
     }
 }
 
+function ConvertTo-ComparablePath {
+    [CmdletBinding()]
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+    $p = $Path.Trim().Trim('"')
+    if ($p.StartsWith('\\?\')) { $p = $p.Substring(4) }
+    $p = $p -replace '/', '\'
+
+    try {
+        # A relative path cannot be evaluated reliably - refuse it rather than
+        # resolving it against the current working directory.
+        if (-not [System.IO.Path]::IsPathRooted($p)) { return $null }
+
+        # Resolves '.' and '..' segments, so traversal cannot escape a root.
+        $p = [System.IO.Path]::GetFullPath($p)
+    } catch {
+        return $null
+    }
+
+    $p = ($p -replace '\\+', '\').TrimEnd('\')
+    if ([string]::IsNullOrWhiteSpace($p)) { return $null }
+
+    $p.ToLowerInvariant()
+}
+
+function Test-PathWithinRoot {
+    [CmdletBinding()]
+    param(
+        [string]$Path,
+        [string]$Root
+    )
+
+    $nPath = ConvertTo-ComparablePath -Path $Path
+    $nRoot = ConvertTo-ComparablePath -Path $Root
+
+    if (-not $nPath) { return $false }
+    if (-not $nRoot) { return $false }
+
+    if ($nPath -eq $nRoot) { return $true }
+
+    # Require a real directory separator so '...\TempEvil' never matches '...\Temp'
+    $nPath.StartsWith(($nRoot + '\'), [System.StringComparison]::Ordinal)
+}
+
 function Get-RecycleBinContent {
     [CmdletBinding()]
     param()
@@ -94,16 +178,17 @@ function Get-RecycleBinContent {
             $isTempSource = $false
             $sourceKnown = $false
 
+            # Classify as TEMP only when the source path is a known TEMP root
+            # or a genuine child of one. Anything unresolvable stays unreliable.
             if (-not [string]::IsNullOrWhiteSpace([string]$originalLocation)) {
-                $sourceKnown = $true
-                $locLower = $originalLocation.ToLower().TrimEnd('\')
-
-                # Check if source is a TEMP directory
-                $userTemp = $env:TEMP.ToLower().TrimEnd('\')
-                $winTemp  = "$env:SystemRoot\Temp".ToLower().TrimEnd('\')
-
-                if ($locLower -eq $userTemp -or $locLower -eq $winTemp) {
+                if (Test-PathWithinRoot -Path $originalLocation -Root $env:TEMP) {
+                    $sourceKnown = $true
                     $isTempSource = $true
+                } elseif (Test-PathWithinRoot -Path $originalLocation -Root "$env:SystemRoot\Temp") {
+                    $sourceKnown = $true
+                    $isTempSource = $true
+                } elseif (ConvertTo-ComparablePath -Path $originalLocation) {
+                    $sourceKnown = $true
                 }
             }
 
@@ -120,6 +205,45 @@ function Get-RecycleBinContent {
     } catch {}
 
     $items
+}
+
+function Send-FileToRecycleBin {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$LiteralPath
+    )
+
+    if (-not ('Microsoft.VisualBasic.FileIO.FileSystem' -as [type])) {
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+    }
+
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+        $LiteralPath,
+        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+    )
+}
+
+function Remove-RecycleBinItemPermanently {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$LiteralPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LiteralPath)) { return }
+    if ($LiteralPath -notmatch '\\\$Recycle\.Bin\\') { return }
+
+    if (-not ('Microsoft.VisualBasic.FileIO.FileSystem' -as [type])) {
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+    }
+
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+        $LiteralPath,
+        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+        [Microsoft.VisualBasic.FileIO.RecycleOption]::DeletePermanently
+    )
 }
 
 function Invoke-PMCleanup {
@@ -148,25 +272,25 @@ function Invoke-PMCleanup {
             # DryRun: report eligible size without deleting
             $cleaned = if ($before) { $before } else { 0 }
         } else {
-            Get-ChildItem -Path $userTemp -Recurse -File -Force -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    try {
-                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
-                    } catch {
-                        $skipped++
-                    }
-                }
+            $tree = Get-TempTreeSafe -Root $userTemp
 
-            # Remove empty dirs
-            Get-ChildItem -Path $userTemp -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-                Sort-Object { $_.FullName.Length } -Descending |
-                ForEach-Object {
-                    try {
-                        if ((Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-                            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
-                        }
-                    } catch {}
+            foreach ($file in $tree.Files) {
+                try {
+                    Send-FileToRecycleBin -LiteralPath $file.FullName
+                } catch {
+                    $skipped++
                 }
+            }
+
+            # Remove empty dirs (deepest first). Reparse points were never
+            # collected, so they can never be removed here.
+            foreach ($dir in ($tree.Directories | Sort-Object { $_.FullName.Length } -Descending)) {
+                try {
+                    if (-not (Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)) {
+                        Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop
+                    }
+                } catch {}
+            }
 
             $after = Get-DirectorySize -Path $userTemp
             $cleaned = if ($before -gt $after) { $before - $after } else { 0 }
@@ -183,14 +307,15 @@ function Invoke-PMCleanup {
         if ($DryRun) {
             $cleaned = if ($before) { $before } else { 0 }
         } else {
-            Get-ChildItem -Path $winTemp -Recurse -File -Force -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    try {
-                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
-                    } catch {
-                        $skipped++
-                    }
+            $tree = Get-TempTreeSafe -Root $winTemp
+
+            foreach ($file in $tree.Files) {
+                try {
+                    Send-FileToRecycleBin -LiteralPath $file.FullName
+                } catch {
+                    $skipped++
                 }
+            }
 
             $after = Get-DirectorySize -Path $winTemp
             $cleaned = if ($before -gt $after) { $before - $after } else { 0 }
@@ -209,7 +334,7 @@ function Invoke-PMCleanup {
     if (-not $DryRun) {
         foreach ($item in $rbCleanable) {
             try {
-                $item.ShellItem.Delete()
+                Remove-RecycleBinItemPermanently -LiteralPath $item.InternalPath
                 $rbCleanedBytes += $item.Size
             } catch {
                 $skipped++

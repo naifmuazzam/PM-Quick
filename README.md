@@ -510,12 +510,13 @@ trustworthy rather than decorative:
 Each suite writes `result-<Suite>.json` into the harness. `Clean-HarnessArtifacts.ps1`
 removes generated sample exports and is dry-run unless given `-Apply`.
 
-### Still a manual step
+### What automation cannot cover
 
-The UAC hand-off, the interactive in-place progress bar and the Y/N confirmation
-gate need a physical console. The automated suites cover the non-elevated branch
-and the redirected-output branch; the UAC-elevated and interactive paths are
-unverified by machine and are not claimed to be covered.
+The UAC hand-off, the interactive in-place progress bar and the consent gate need
+a physical console. The automated suites cover the non-elevated branch and the
+redirected-output branch only; they are not evidence about the elevated or
+interactive paths. Those were exercised by hand instead, and the split between
+the two is recorded under Project status rather than claimed as automated.
 
 ---
 
@@ -526,11 +527,11 @@ unverified by machine and are not claimed to be covered.
 | Read/write split | Complete |
 | Read-only inspection modules | Complete |
 | Collection progress (6 steps, console + redirected) | Complete |
-| Mandatory elevation in `PM-Quick.bat` | Complete — non-elevated branch verified, UAC branch manual |
+| Mandatory elevation in `PM-Quick.bat` | Complete — non-elevated branch automated, UAC branch verified by hand |
 | Temp-Cleaner safety code | Complete - 7 of 11 surviving functions byte-identical to the frozen baseline; the recycle round trip was removed on purpose |
 | Automated validation | Complete — 562 assertions, 0 failures |
-| Real environment validation | **Pending** — requires physical execution |
-| Release | **Blocked** until real-environment validation is signed off |
+| Real environment validation | **Partial** — see below |
+| Release | v1.1 published. Gate was the physical run, and that was performed. |
 
 The three moved functions that are **not** byte-identical were each changed on
 purpose, and P1a asserts the specific markers that prove the change is the
@@ -542,8 +543,25 @@ intended one rather than an unrelated edit:
 | `Get-DirectorySize` | Returns a real `0` for an existing-but-empty directory instead of `$null`. |
 | `Invoke-PMCleanup` | Warnings use `.ToArray()`; on PowerShell 5.1 `@($list)` yields a one-element array holding the list. |
 
-This is not claimed to be production ready. The release gate is the physical
-validation, not the automated suite.
+Physical execution was performed on a real desktop before v1.1 was tagged.
+
+Verified by hand, on the target machine:
+
+- `PM-Quick.bat` UAC elevation and the full read-only collection
+- `Temp-Cleaner.bat` UAC elevation, the in-place progress bar, and the `Y`
+  consent path
+- permanent-delete behaviour, including a non-TEMP Recycle Bin item
+  (`Naif_Muazzam_CV_MASTER-1.pdf`) surviving every run untouched
+- the runtime effect of the performance fix: 56s before, 0-1s after
+
+Not verified by hand:
+
+- the `N` consent path and the Ctrl+C abort path
+- the aggregate `SKIPPED` block as finally rendered, which was still
+  automated-only at the time of tagging
+
+This is not claimed to be production ready. The automated suite and a single
+happy-path physical run are not the same as broad field use.
 
 ---
 

@@ -380,28 +380,23 @@ function Get-PMReportValue {
     return $prop.Value
 }
 
-function Get-PMShortSkipReason {
-    [CmdletBinding()]
-    param([string]$Reason)
+function Get-PMSkipCategoryLabel {
+    <#
+    .SYNOPSIS
+        Human wording for a skip-category code.
+    .DESCRIPTION
+        The codes are for counting. This turns them into something a technician
+        can read in a sentence, without listing file names.
+    #>
+    param([string]$Code)
 
-    if ([string]::IsNullOrWhiteSpace($Reason)) { return 'unknown' }
-
-    $r = $Reason.Trim()
-    # The raw exception text repeats the full path that was already printed as
-    # the file name, which is what made the Details block read as noise:
-    #   Access to the path 'C:\Users\...\Temp\.bdfbd97fff6f3f8c.dll' is denied.
-    if ($r -match '(?i)access to the path .+ is denied') { return 'access denied' }
-    if ($r -match '(?i)access is denied')                { return 'access denied' }
-    if ($r -match '(?i)being used by another process')   { return 'in use by another process' }
-    if ($r -match '(?i)permission')                      { return 'permission denied' }
-    if ($r -match '(?i)cannot find|no such file')        { return 'not found' }
-
-    # Anything unrecognised keeps its first sentence, minus any quoted path.
-    $first = ($r -split '(?<=\.)\s+')[0]
-    $first = [regex]::Replace($first, "'[^']*'", '')
-    $first = [regex]::Replace($first, '\s{2,}', ' ').Trim().TrimEnd('.', ',', ';')
-    if ($first.Length -gt 40) { $first = $first.Substring(0, 37).TrimEnd() + '...' }
-    return $first
+    switch ($Code) {
+        'in-use' { return 'held open by a running process' }
+        'denied' { return 'access denied' }
+        'other'  { return 'other reason' }
+        'unknown'{ return 'unknown reason' }
+        default  { return $Code }
+    }
 }
 
 function Format-PMCleanupReport {
@@ -495,34 +490,39 @@ function Format-PMCleanupReport {
         $rows.Add(@('DETAIL', "$inUse of those were held open by a running process. They are swept on the next run or after a restart."))
     }
 
-    # Only reasons that may need a human are listed here.
-    if ($warnList.Count -gt 0) {
-        $rows.Add(@('DETAILHEAD', 'Details:'))
-        # "[WARN] User TEMP: 'name' - reason" is the stored contract, so it is
-        # unpacked here rather than at the point of capture. Every line used to
-        # print as
-        #   [WARN] User TEMP: '.foo.dll' - Access to the path 'C:\...\foo.dll' is denied.
-        # which named the file twice and spent most of the line on a prefix. The
-        # stage is only shown when the list mixes stages; otherwise the per-stage
-        # counts above already say which stage a file came from.
-        $warnStages = @{}
-        foreach ($w in $warnList) {
-            $m = [regex]::Match([string]$w, '^\[WARN\]\s*(?<stage>[^:]+):')
-            if ($m.Success) { $warnStages[$m.Groups['stage'].Value] = $true }
+    # Anything that is not a lock is still reported, but as a count and a
+    # reason rather than a list of file names. The per-file listing was removed
+    # on the user's instruction: a TEMP file that cannot be removed is not
+    # something they can chase individually, and the names were the noisiest
+    # part of the output. Denied is deliberately kept out of the "held open"
+    # bucket above, because a permission problem does not clear on a restart and
+    # saying otherwise would be a lie.
+    $reasons = Get-PMReportValue -InputObject $Result -Name 'SkipReasons' -Default @{}
+    $otherParts = New-Object System.Collections.Generic.List[string]
+    [int]$otherTotal = 0
+    [int]$otherKinds = 0
+    [int]$otherOnlyCount = 0
+    [string]$otherOnlyLabel = ''
+    foreach ($code in (@($reasons.Keys) | Sort-Object)) {
+        if ($code -eq 'in-use') { continue }
+        $n = [int]$reasons[$code]
+        if ($n -gt 0) {
+            $otherTotal += $n
+            $otherKinds++
+            $otherOnlyCount = $n
+            $otherOnlyLabel = Get-PMSkipCategoryLabel $code
+            $otherParts.Add(("$n " + $otherOnlyLabel))
         }
-        $multiStage = $warnStages.Count -gt 1
-        foreach ($w in $warnList) {
-            $text = [string]$w
-            $m = [regex]::Match($text, "^\[WARN\]\s*(?<stage>[^:]+):\s*'(?<name>[^']*)'\s*-\s*(?<reason>.*)$")
-            if (-not $m.Success) {
-                # The truncation notice has no stage/name to unpack.
-                $rows.Add(@('WARN', $text))
-                continue
-            }
-            $label = $m.Groups['name'].Value
-            if ($multiStage) { $label = $m.Groups['stage'].Value.Trim() + ' ' + $label }
-            $rows.Add(@('WARN', $label, (Get-PMShortSkipReason $m.Groups['reason'].Value)))
+    }
+    if ($otherTotal -gt 0) {
+        if (-not $openedSkipped) { $rows.Add(@('SECTION', 'SKIPPED')); $openedSkipped = $true }
+        # With a single reason the count is already stated, so do not repeat it.
+        if ($otherKinds -eq 1 -and $otherOnlyCount -eq $otherTotal) {
+            $why = $otherOnlyLabel
+        } else {
+            $why = ($otherParts -join ', ')
         }
+        $rows.Add(@('DETAIL', "$otherTotal could not be removed ($why)."))
     }
 
     $out = New-Object System.Collections.Generic.List[string]
@@ -533,11 +533,7 @@ function Format-PMCleanupReport {
             'SECTION'    { $out.Add(''); $out.Add($row[1]) }
             'FIELD'      { $out.Add(('  {0,-18}: {1}' -f $row[1], $row[2])) }
             'DETAIL'     { $out.Add(('    ' + $row[1])) }
-            'DETAILHEAD' { $out.Add(''); $out.Add(('    ' + $row[1])) }
-            'WARN' {
-                if ($row.Count -ge 3) { $out.Add(('      {0,-32} {1}' -f $row[1], $row[2])) }
-                else                 { $out.Add(('    ' + $row[1])) }
-            }
+            'WARN'       { $out.Add(('    ' + $row[1])) }
         }
     }
 

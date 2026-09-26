@@ -491,7 +491,6 @@ if ($summary) {
 # of defaulting to yes.
 $exportedReport = $null
 $exportFailed = $false
-$exportDeclined = $false
 
 function Get-PMExportDecision {
     # Total and side-effect free: returns the decision, never infers one.
@@ -545,6 +544,84 @@ function Request-PMExportDecision {
     return $decision
 }
 
+function Resolve-PMExportName {
+    <#
+    .SYNOPSIS
+        Turns whatever was typed at the name prompt into a safe file name.
+    .DESCRIPTION
+        Pure - returns a name, or $null if the request must be refused. Total
+        and side-effect free, so the refusal rules are testable on their own.
+
+        Refused:
+          - anything holding a path character, so the write cannot be redirected
+            out of the output directory by .., a rooted path or a UNC share
+          - a name made only of dots ('.' and '..' are not file names)
+          - a name ending in a dot or space, because Win32 silently strips those
+            and would write to a differently named file than the one displayed
+
+        A reserved device name is not refused here. Windows rejects those at
+        write time and the caller already surfaces the real error, so guessing
+        at the list here would only add a second, divergent copy of it.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Typed,
+        [string]$DefaultName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DefaultName)) {
+        $DefaultName = 'pm-quick-{0}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss')
+    }
+    if ([string]::IsNullOrWhiteSpace($Typed)) { $Typed = $DefaultName }
+
+    $name = $Typed.Trim()
+    if ([string]::IsNullOrWhiteSpace($name)) { return $null }
+    # The backslash must be doubled here. In a single-quoted PowerShell string
+    # '[\\/...]' is a class holding both separators; writing '[\/...]' lets the
+    # backslash escape the slash instead of matching it, which would let
+    # '..\evil.json' straight through.
+    if ($name -match '[\\/:*?"<>|]') { return $null }
+    if ($name -match '^\.+$') { return $null }
+    # Trim has already removed a trailing space, so only the dot is left to
+    # catch: Win32 strips it silently and the file written would not match the
+    # name shown to the user.
+    if ($name -match '\.$') { return $null }
+    return $name
+}
+
+function Get-PMClosingSummary {
+    <#
+    .SYNOPSIS
+        Builds the closing block, stating what actually happened.
+    .DESCRIPTION
+        Pure - returns lines, prints nothing. An unconditional "nothing was
+        changed" would be a false claim in the one mode that does write a file,
+        so each outcome gets its own wording and each is asserted by the suite.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$ExportedReport,
+        [switch]$ExportFailed
+    )
+
+    $lines = @(
+        '========================================'
+        'Read-only report complete.'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ExportedReport)) {
+        $lines += 'No existing file, setting or data was changed, and'
+        $lines += 'nothing was deleted or uploaded. The only file written'
+        $lines += 'was the report you saved on request:'
+        $lines += "  $ExportedReport"
+    } elseif ($ExportFailed) {
+        $lines += 'Nothing was changed, deleted or uploaded. The JSON export'
+        $lines += 'did not succeed, so no report file was written.'
+    } else {
+        $lines += 'Nothing was changed, deleted or uploaded.'
+    }
+    $lines += 'For TEMP/Recycle Bin cleanup run Temp-Cleaner.bat'
+    $lines += '========================================'
+    return $lines
+}
+
 if (-not $Json) {
     # Never prompt when there is no human there to answer. A redirected stdin
     # returns EOF forever and would spin, so the offer is skipped outright.
@@ -568,18 +645,16 @@ if (-not $Json) {
                 # Interrupted at the name prompt: no file, no error spew.
                 $typed = $null
             }
-            if ([string]::IsNullOrWhiteSpace($typed)) { $typed = $defaultName }
-            # Refuse a name that would escape the output directory. A report is
-            # not worth letting a stray .. or an absolute path redirect the write.
-            if ($typed -match '[\/:*?"<>|]' -or $typed -match '^\s*\.\.?\s*$') {
+            $safeName = Resolve-PMExportName -Typed $typed -DefaultName $defaultName
+            if ($safeName) {
+                $Json = $safeName
+            } else {
                 Write-Host "  '$typed' is not a usable file name. Nothing was written." -ForegroundColor Red
                 $exportFailed = $true
-            } else {
-                $Json = $typed
             }
-        } else {
-            $exportDeclined = $true
         }
+        # A declined offer is deliberately silent: nothing happened, and the
+        # summary says exactly that.
     }
 }
 
@@ -608,19 +683,11 @@ if ($Json) {
 # States what actually happened. An unconditional "nothing was changed" would be
 # a false claim in the one mode that does write a file.
 Write-Host ""
-Write-Host "  ========================================" -ForegroundColor Cyan
-Write-Host "  Read-only report complete." -ForegroundColor DarkGray
-if ($exportedReport) {
-    Write-Host "  No existing file, setting or data was changed, and" -ForegroundColor DarkGray
-    Write-Host "  nothing was deleted or uploaded. The only file written" -ForegroundColor DarkGray
-    Write-Host "  was the report you saved on request:" -ForegroundColor DarkGray
-    Write-Host "    $exportedReport" -ForegroundColor DarkGray
-} elseif ($exportFailed) {
-    Write-Host "  Nothing was changed, deleted or uploaded. The JSON export" -ForegroundColor DarkGray
-    Write-Host "  did not succeed, so no report file was written." -ForegroundColor DarkGray
-} else {
-    Write-Host "  Nothing was changed, deleted or uploaded." -ForegroundColor DarkGray
+foreach ($summaryLine in Get-PMClosingSummary -ExportedReport $exportedReport -ExportFailed:$exportFailed) {
+    if ($summaryLine -match '^=+$') {
+        Write-Host "  $summaryLine" -ForegroundColor Cyan
+    } else {
+        Write-Host "  $summaryLine" -ForegroundColor DarkGray
+    }
 }
-Write-Host "  For TEMP/Recycle Bin cleanup run Temp-Cleaner.bat" -ForegroundColor DarkGray
-Write-Host "  ========================================" -ForegroundColor Cyan
 Write-Host ""

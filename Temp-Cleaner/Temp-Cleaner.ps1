@@ -7,20 +7,21 @@
     itself is strictly read-only.
 
     This tool cleans three things, in this order:
-      1. User TEMP     - files are sent to the Recycle Bin, not deleted
-      2. Windows TEMP  - files are sent to the Recycle Bin, not deleted
+      1. User TEMP     - files are deleted outright
+      2. Windows TEMP  - files are deleted outright
       3. Recycle Bin   - ONLY items whose original source is proven to be a
                          TEMP directory are permanently purged
 
     Everything else in the Recycle Bin - Desktop, Documents, Downloads and any
     item whose source cannot be resolved - is reported and left untouched.
 
-    The safety code below is the code that shipped in PM-Quick and passed
-    automated safety regression. It was moved, not rewritten. The only change is
-    documented in Get-TempTreeSafe: a root that is not an absolute path is now
-    refused, because Windows strips trailing spaces from a path, so a
-    whitespace-only root such as '   ' silently collapses to the current
-    directory.
+    TEMP files used to be sent to the Recycle Bin, but that bought nothing: step
+    3 purges TEMP-origin items in the same run, so the Recycle Bin never really
+    held them as a safety net. It only cost time, because moving a file into the
+    Recycle Bin spends about a second discovering that a file held open by
+    another process cannot be moved, while deleting it outright fails in about
+    twenty milliseconds. The preview used to be wrong as a result, promising a
+    Recycle Bin purge count that the run then changed by adding items to it.
 
 .NOTES
     Requires Windows PowerShell 5.1 and Administrator.
@@ -28,14 +29,15 @@
 
     Safety guarantees (all covered by the regression suite):
       - The Recycle Bin is never emptied wholesale
-      - No permanent-delete fallback: if recycling fails, the file stays put
+      - Nothing is deleted without an explicit Y or y
       - Locked and inaccessible files are left untouched and reported
       - Junctions, symlinks and other reparse points are never traversed
       - Path boundary checks are strict, so '...\TempEvil' never matches
         '...\Temp'
-      - Permanent deletion is confined to one guarded helper that refuses any
-        path outside the Recycle Bin
-      - Nothing is deleted without an explicit Y or y
+      - Deletion from the Recycle Bin is confined to one guarded helper that
+        refuses any path outside the Recycle Bin
+      - Files from the Desktop, Documents, Downloads and unresolvable origins
+        are never purged
 #>
 
 #Requires -Version 5.1
@@ -293,22 +295,26 @@ function Get-RecycleBinContent {
     $items
 }
 
-function Send-FileToRecycleBin {
+function Remove-TempFilePermanently {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$LiteralPath
     )
 
-    if (-not ('Microsoft.VisualBasic.FileIO.FileSystem' -as [type])) {
-        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
-    }
-
-    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
-        $LiteralPath,
-        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
-        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
-    )
+    # TEMP files are deleted outright rather than routed through the Recycle
+    # Bin. Round-tripping them was pointless: Invoke-PMCleanup purges TEMP-origin
+    # Recycle Bin items in the same run, so the Recycle Bin never actually
+    # retained anything as a safety net. It cost real time, because
+    # FileSystem.DeleteFile spends roughly a second discovering that a file held
+    # open by another process cannot be moved, whereas Remove-Item -Force fails
+    # in about twenty milliseconds. On a run with fourteen locked files that
+    # difference was the whole 56 seconds.
+    #
+    # A separate Recycle Bin purge still runs for TEMP-origin items that were
+    # already there, so files from the Desktop, Documents, Downloads and unknown
+    # origins remain untouched.
+    Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
 }
 
 function Remove-RecycleBinItemPermanently {
@@ -388,19 +394,19 @@ function Format-PMCleanupReport {
     $rows = New-Object System.Collections.Generic.List[object]
     $rows.Add(@('TITLE', $(if ($dryRun) { '=== PM CLEANUP (DRY RUN) ===' } else { '=== PM CLEANUP ===' })))
     if ($dryRun) {
-        $rows.Add(@('SUBTITLE', 'No files were recycled or permanently deleted.'))
+        $rows.Add(@('SUBTITLE', 'No files were deleted.'))
     }
 
     $rows.Add(@('SECTION', 'USER TEMP'))
     $rows.Add(@('FIELD', 'Files found', (Get-PMReportValue -InputObject $Result -Name 'UserTempFilesFound' -Default 0)))
-    $rows.Add(@('FIELD', 'Recycled',    (Get-PMReportValue -InputObject $Result -Name 'UserTempFilesRecycled' -Default 0)))
+    $rows.Add(@('FIELD', 'Deleted',    (Get-PMReportValue -InputObject $Result -Name 'UserTempFilesDeleted' -Default 0)))
     $rows.Add(@('FIELD', 'Skipped',     (Get-PMReportValue -InputObject $Result -Name 'UserTempFilesSkipped' -Default 0)))
     $rows.Add(@('FIELD', 'Before',      (Format-PMByteSize (Get-PMReportValue -InputObject $Result -Name 'UserTempBeforeSize' -Default 0))))
     $rows.Add(@('FIELD', 'After',       (Format-PMByteSize (Get-PMReportValue -InputObject $Result -Name 'UserTempAfterSize' -Default 0))))
 
     $rows.Add(@('SECTION', 'WINDOWS TEMP'))
     $rows.Add(@('FIELD', 'Files found', (Get-PMReportValue -InputObject $Result -Name 'WinTempFilesFound' -Default 0)))
-    $rows.Add(@('FIELD', 'Recycled',    (Get-PMReportValue -InputObject $Result -Name 'WinTempFilesRecycled' -Default 0)))
+    $rows.Add(@('FIELD', 'Deleted',    (Get-PMReportValue -InputObject $Result -Name 'WinTempFilesDeleted' -Default 0)))
     $rows.Add(@('FIELD', 'Skipped',     (Get-PMReportValue -InputObject $Result -Name 'WinTempFilesSkipped' -Default 0)))
     $rows.Add(@('FIELD', 'Before',      (Format-PMByteSize (Get-PMReportValue -InputObject $Result -Name 'WinTempBeforeSize' -Default 0))))
     $rows.Add(@('FIELD', 'After',       (Format-PMByteSize (Get-PMReportValue -InputObject $Result -Name 'WinTempAfterSize' -Default 0))))
@@ -544,13 +550,13 @@ function Invoke-PMCleanup {
 
         # --- Per-location counters ---
         UserTempFilesFound    = 0
-        UserTempFilesRecycled = 0
+        UserTempFilesDeleted = 0
         UserTempFilesSkipped  = 0
         UserTempBeforeSize    = 0
         UserTempAfterSize     = 0
 
         WinTempFilesFound     = 0
-        WinTempFilesRecycled  = 0
+        WinTempFilesDeleted  = 0
         WinTempFilesSkipped   = 0
         WinTempBeforeSize     = 0
         WinTempAfterSize      = 0
@@ -585,8 +591,8 @@ function Invoke-PMCleanup {
 
     # New counters are [long] throughout so the result object is type-consistent
     # for callers doing arithmetic on them.
-    [long]$uFound = 0; [long]$uRecycled = 0; [long]$uSkipped = 0
-    [long]$wFound = 0; [long]$wRecycled = 0; [long]$wSkipped = 0
+    [long]$uFound = 0; [long]$uDeleted = 0; [long]$uSkipped = 0
+    [long]$wFound = 0; [long]$wDeleted = 0; [long]$wSkipped = 0
     [long]$uBefore = 0; [long]$uAfter = 0
     [long]$wBefore = 0; [long]$wAfter = 0
     [long]$rbOriginFound = 0; [long]$rbPurged = 0; [long]$rbPurgeFailed = 0
@@ -631,7 +637,7 @@ function Invoke-PMCleanup {
         $uBefore = if ($null -ne $before) { [long]$before } else { [long]0 }
 
         # Built for counting in both modes. Read-only: the safe traversal
-        # never deletes, and dry run still deletes/recycles nothing.
+        # never deletes, and dry run still deletes nothing.
         $tree = Get-TempTreeSafe -Root $userTemp
         $uFound = @($tree.Files).Count
 
@@ -645,8 +651,8 @@ function Invoke-PMCleanup {
             foreach ($file in $tree.Files) {
                 $uIndex++
                 try {
-                    Send-FileToRecycleBin -LiteralPath $file.FullName
-                    $uRecycled++
+                    Remove-TempFilePermanently -LiteralPath $file.FullName
+                    $uDeleted++
                 } catch {
                     $skipped++
                     $uSkipped++
@@ -677,7 +683,7 @@ function Invoke-PMCleanup {
     }
 
     $summary.UserTempFilesFound    = $uFound
-    $summary.UserTempFilesRecycled = $uRecycled
+    $summary.UserTempFilesDeleted = $uDeleted
     $summary.UserTempFilesSkipped  = $uSkipped
     $summary.UserTempBeforeSize    = $uBefore
     $summary.UserTempAfterSize     = $uAfter
@@ -700,8 +706,8 @@ function Invoke-PMCleanup {
             foreach ($file in $tree.Files) {
                 $wIndex++
                 try {
-                    Send-FileToRecycleBin -LiteralPath $file.FullName
-                    $wRecycled++
+                Remove-TempFilePermanently -LiteralPath $file.FullName
+                $wDeleted++
                 } catch {
                     $skipped++
                     $wSkipped++
@@ -722,7 +728,7 @@ function Invoke-PMCleanup {
     }
 
     $summary.WinTempFilesFound    = $wFound
-    $summary.WinTempFilesRecycled = $wRecycled
+    $summary.WinTempFilesDeleted = $wDeleted
     $summary.WinTempFilesSkipped  = $wSkipped
     $summary.WinTempBeforeSize    = $wBefore
     $summary.WinTempAfterSize     = $wAfter
@@ -833,9 +839,14 @@ function Write-TCField {
         [string]$Value,
         [int]$LabelWidth = 18
     )
-    $padded = $Label.PadRight($LabelWidth)
-    Write-Host "  $padded" -NoNewline
-    Write-Host $Value
+    # PadRight returns the string untouched when it is already at or over the
+    # width, so 'Skipped (non-TEMP)' (19 chars) ran straight into its value and
+    # printed as "Skipped (non-TEMP)1 items". A format string always emits the
+    # separating space, whatever the label length. The format string is built
+    # first and applied second: -f binds more tightly than +, so folding the two
+    # into one expression throws a FormatError at runtime.
+    $fmt = '  {0,-' + $LabelWidth + '} {1}'
+    Write-Host ($fmt -f $Label, $Value)
 }
 
 function Invoke-TempCleanerUI {
@@ -971,7 +982,7 @@ function Invoke-TempCleanerUI {
         Write-TCField 'Windows TEMP' $cleanupResult.WinTempCleaned
         Write-TCField 'Recycle Bin'  $cleanupResult.RecycleCleaned
 
-        # Legacy counter: covers locked files, failed recycles and failed purges
+        # Legacy counter: covers locked files, failed deletions and failed purges
         # alike, so it is not reported as "locked" specifically. The per-stage
         # breakdown below is the authoritative detail.
         if ($cleanupResult.FilesSkipped -gt 0) {

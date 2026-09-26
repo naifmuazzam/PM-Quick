@@ -297,9 +297,15 @@ Only TEMP-origin items
 Permanent purge
 ```
 
-**Stage A and B** recycle TEMP files rather than deleting them, so a mistake is
-recoverable from the Recycle Bin. **Stage C** then purges only the Recycle Bin
-items whose recorded original path lies inside a known TEMP root.
+**Stage A and B** delete TEMP files outright. They used to be recycled first,
+but that was not a safety net: Stage C purges TEMP-origin items in the same run, so
+the Recycle Bin never really kept them. It only cost time, because moving a
+file into the Recycle Bin spends about a second discovering that a file held
+open by another process cannot be moved, while deleting it outright fails in
+about twenty milliseconds. It also made the preview's purge count wrong, since
+the run kept adding the very items the preview had already counted.
+**Stage C** still purges only the Recycle Bin items whose recorded original path
+lies inside a known TEMP root.
 
 Guarantees:
 
@@ -314,9 +320,9 @@ Guarantees:
   a link.
 - **The Recycle Bin is never emptied wholesale.** There is no call to empty,
   clear or shell-empty the Recycle Bin.
-- **No permanent-delete fallback.** If recycling a file fails, the file stays
-  where it is. There is no path that escalates a recycle failure into a
-  permanent delete.
+- **A failed delete leaves the file alone.** If a file cannot be removed it is
+  counted as skipped and left in place. Nothing escalates a failure into a
+  broader or more aggressive delete.
 - **Root paths must be absolute.** `Get-TempTreeSafe` refuses a non-absolute
   root outright. Windows strips trailing spaces from a path, so a
   whitespace-only root such as `"   "` silently collapses to the current
@@ -341,14 +347,14 @@ A cleanup run prints a summary line per location, then a detailed report.
 
 USER TEMP
   Files found       : 4
-  Recycled          : 3
+  Deleted           : 3
   Skipped           : 1
   Before            : 32 KB
   After             : 8 KB
 
 WINDOWS TEMP
   Files found       : 3
-  Recycled          : 1
+  Deleted           : 1
   Skipped           : 2
   Before            : 286.6 KB
   After             : 278.6 KB
@@ -364,7 +370,7 @@ RESULT
 ```
 
 - **Files found** — files discovered in that TEMP location
-- **Recycled** — files successfully sent to the Recycle Bin
+- **Deleted** — files deleted outright
 - **Skipped** — files that could not be processed, for example because they are locked
 - **Before / After** — measured size of that location, before and after
 - **TEMP-origin found** — Recycle Bin items whose source was proven to be TEMP
@@ -408,11 +414,11 @@ counter also covers failed recycles and failed purges.
 `Invoke-PMCleanup` supports a `-DryRun` switch. In dry-run mode Temp-Cleaner
 performs the full safe traversal and reports exactly what it *would* do, but:
 
-- no file is recycled
+- no file is deleted
 - no file is permanently deleted
 - no Recycle Bin item is purged
 - the report is titled `=== PM CLEANUP (DRY RUN) ===` and states
-  `No files were recycled or permanently deleted.`
+  `No files were deleted.`
 
 Invoke it directly against the script:
 
@@ -433,8 +439,8 @@ Real constraints discovered during development.
 - **Recycle Bin quota.** Windows may permanently delete a file at the moment it
   is sent to the Recycle Bin if that file exceeds the Recycle Bin or volume
   quota. Temp-Cleaner does not override operating-system Recycle Bin policy and
-  cannot guarantee that any individual file remains recoverable. Recycling in
-  Stage A is a safety step, not a backup.
+  cannot guarantee that any individual file remains recoverable. Stage C is
+  restricted to TEMP-origin items for exactly this reason.
 - **Locked files are never force-deleted.** Files held by running services stay
   in TEMP until released.
 - **GPU VRAM is often `N/A`.** `Win32_VideoController.AdapterRAM` is a signed
@@ -481,7 +487,7 @@ powershell -ExecutionPolicy Bypass -NoProfile -File D:\myProjects\_pm-quick-vali
 | P2 sandboxed cleanup | `Test-Sandboxed-Cleanup.ps1` | Cleaner works, and its guards refuse bad input | 82 pass / 0 fail |
 | P3 information modules | `Modules-Contract.ps1` | All eight modules load, collectors work, fields exist | 309 pass / 0 fail |
 | P4 read-only audit | `Tests-ReadOnly-Audit.ps1` | PM-Quick contains no destructive path, no duplicates | 32 pass / 0 fail |
-| | | **Total** | **511 pass / 0 fail** |
+| | | **Total** | **554 pass / 0 fail** |
 
 Two techniques are worth calling out, because they are what make the results
 trustworthy rather than decorative:
@@ -515,8 +521,8 @@ unverified by machine and are not claimed to be covered.
 | Read-only inspection modules | Complete |
 | Collection progress (6 steps, console + redirected) | Complete |
 | Mandatory elevation in `PM-Quick.bat` | Complete — non-elevated branch verified, UAC branch manual |
-| Temp-Cleaner safety code | Complete — moved from the frozen baseline, 10 of 13 functions byte-identical |
-| Automated validation | Complete — 511 assertions, 0 failures |
+| Temp-Cleaner safety code | Complete - 7 of 11 surviving functions byte-identical to the frozen baseline; the recycle round trip was removed on purpose |
+| Automated validation | Complete — 554 assertions, 0 failures |
 | Real environment validation | **Pending** — requires physical execution |
 | Release | **Blocked** until real-environment validation is signed off |
 

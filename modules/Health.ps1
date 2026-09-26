@@ -70,45 +70,61 @@ function Get-PMHealthCheck {
             $firmware = if ($tpm.ManufacturerVersionFull20) { $tpm.ManufacturerVersionFull20 } else { 'unknown firmware' }
             $specVer  = if ($null -ne $tpm.SpecVersion) { $tpm.SpecVersion } else { 'unknown spec version' }
 
-            # Win32_Tpm's boolean properties are spelled with a trailing
-            # underscore, but the class has carried both spellings across
-            # Windows builds, and a name that does not exist reads as $null
-            # rather than failing. So both are tried and the first hit wins.
-            # Anything still unreadable is reported as Unknown: claiming the
-            # firmware has the TPM off because we could not read a property is
-            # a false accusation, and it sends the user to change a BIOS setting
-            # that was already correct.
-            $enabledRaw = $null
-            foreach ($name in 'IsEnabled_', 'IsEnabled') {
-                $prop = $tpm.PSObject.Properties[$name]
-                if ($null -ne $prop) { $enabledRaw = $prop.Value; break }
+            # Win32_Tpm spells its state properties three different ways across
+            # builds, and a name that does not exist reads as $null rather than
+            # failing, so a single wrong guess silently reported a healthy TPM as
+            # broken. All three are tried, live names first, and the
+            # _InitialValue forms last: those record the state at boot, which is
+            # the value in force until the next restart.
+            $toBool = {
+                param($v)
+                if ($null -eq $v) { return $null }
+                if ($v -is [string]) {
+                    if ($v -match '^\s*(1|true|yes)\s*$') { return $true }
+                    if ($v -match '^\s*(0|false|no)\s*$')  { return $false }
+                    return $null
+                }
+                return [bool]$v
             }
-            $activatedRaw = $null
-            foreach ($name in 'IsActivated_', 'IsActivated') {
-                $prop = $tpm.PSObject.Properties[$name]
-                if ($null -ne $prop) { $activatedRaw = $prop.Value; break }
+            $readFlag = {
+                param($Object, [string[]]$Names)
+                foreach ($n in $Names) {
+                    $p = $Object.PSObject.Properties[$n]
+                    if ($null -ne $p) {
+                        $b = & $toBool $p.Value
+                        if ($null -ne $b) { return [pscustomobject]@{ Value = $b; Name = $n } }
+                    }
+                }
+                return $null
             }
 
-            if ($null -eq $enabledRaw -and $null -eq $activatedRaw) {
+            $enabledHit   = & $readFlag $tpm @('IsEnabled_', 'IsEnabled', 'IsEnabled_InitialValue')
+            $activatedHit = & $readFlag $tpm @('IsActivated_', 'IsActivated', 'IsActivated_InitialValue')
+
+            if (-not $enabledHit -and -not $activatedHit) {
                 $seen = @($tpm.PSObject.Properties.Name | Where-Object { $_ -like 'Is*' }) -join ', '
                 Add-Check 'TPM' 'Unknown' $specVer `
                     "TPM $firmware is present, but Windows did not report its enabled or activated state. Flags returned by this build: $seen"
             } else {
-                $enabled   = [bool]$enabledRaw
-                $activated = [bool]$activatedRaw
+                $enabled   = [bool]$enabledHit.Value
+                $activated = [bool]$activatedHit.Value
+                $atBoot = (($enabledHit -and $enabledHit.Name -like '*_InitialValue') -or
+                           ($activatedHit -and $activatedHit.Name -like '*_InitialValue'))
+                $bootNote = if ($atBoot) { ' (state recorded at boot)' } else { '' }
+
                 # The detail is derived from the flags, because a fixed
                 # "is enabled and activated" printed next to a Warning status is
                 # a contradiction the reader cannot resolve.
                 if ($enabled -and $activated) {
                     $status = 'OK'
-                    $detail = "TPM $firmware is enabled and activated."
+                    $detail = "TPM $firmware is enabled and activated$bootNote."
                 } else {
                     $status = 'Warning'
                     $faults = @()
                     if (-not $enabled)   { $faults += 'not enabled in firmware' }
                     if (-not $activated) { $faults += 'present but not activated' }
                     if ($faults.Count -eq 0) { $faults += 'in an unrecognised state' }
-                    $detail = "TPM $firmware is " + ($faults -join ' and ') + '.'
+                    $detail = "TPM $firmware is " + ($faults -join ' and ') + "$bootNote."
                 }
                 Add-Check 'TPM' $status $specVer $detail
             }

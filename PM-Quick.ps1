@@ -602,20 +602,12 @@ function Get-PMClosingSummary {
         [switch]$ExportFailed
     )
 
-    $lines = @(
-        '========================================'
-        'Read-only report complete.'
-    )
+    $lines = @('========================================')
+    $lines += 'Nothing was changed, deleted or uploaded.'
     if (-not [string]::IsNullOrWhiteSpace($ExportedReport)) {
-        $lines += 'No existing file, setting or data was changed, and'
-        $lines += 'nothing was deleted or uploaded. The only file written'
-        $lines += 'was the report you saved on request:'
-        $lines += "  $ExportedReport"
+        $lines += "Saved: $ExportedReport"
     } elseif ($ExportFailed) {
-        $lines += 'Nothing was changed, deleted or uploaded. The JSON export'
-        $lines += 'did not succeed, so no report file was written.'
-    } else {
-        $lines += 'Nothing was changed, deleted or uploaded.'
+        $lines += 'Export failed - no report file was written.'
     }
     $lines += 'For TEMP/Recycle Bin cleanup run Temp-Cleaner.bat'
     $lines += '========================================'
@@ -669,7 +661,6 @@ if ($Json) {
         $exportedReport = $saved
         Write-Host ""
         Write-Host "  Report saved locally: $saved" -ForegroundColor Green
-        Write-Host "  (local file only - nothing was uploaded)" -ForegroundColor DarkGray
     } catch {
         $exportFailed = $true
         Write-Host ""

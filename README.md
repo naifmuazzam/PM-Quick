@@ -473,42 +473,36 @@ Real constraints discovered during development.
 
 ## 12. Testing
 
-Validation runs from a **durable harness outside the repository**, so no test
-artefact can ever be committed by accident:
+Validation was run from a durable harness kept outside the repository, so no
+test artefact could be committed by accident. The harness has since been
+deleted, and the results below are a historical record rather than something
+you can reproduce from this repository. The last full run was against v1.1.
 
-```text
-D:\myProjects\_pm-quick-validation\
-```
+| Suite | Scope | Result at v1.1 |
+|---|---|---|
+| P1a function parity | Destructive code moved from the frozen baseline unchanged | 45 pass / 0 fail |
+| P1b runtime read-only | Runs PM-Quick and proves it changes nothing on disk | 45 pass / 0 fail |
+| P2 sandboxed cleanup | Cleaner works, and its guards refuse bad input | 122 pass / 0 fail |
+| P3 information modules | All eight modules load, collectors work, fields exist | 318 pass / 0 fail |
+| P4 read-only audit | PM-Quick contains no destructive path, no duplicates | 32 pass / 0 fail |
+| | **Total** | **562 pass / 0 fail** |
 
-Run everything with one command:
-
-```powershell
-powershell -ExecutionPolicy Bypass -NoProfile -File D:\myProjects\_pm-quick-validation\Run-Gauntlet.ps1
-```
-
-| Suite | Script | Scope | Result |
-|---|---|---|---|
-| P1a function parity | `Test-Function-Parity.ps1` | Destructive code moved from the frozen baseline unchanged | 45 pass / 0 fail |
-| P1b runtime read-only | `Test-Runtime-ReadOnly.ps1` | Runs PM-Quick and proves it changes nothing on disk | 45 pass / 0 fail |
-| P2 sandboxed cleanup | `Test-Sandboxed-Cleanup.ps1` | Cleaner works, and its guards refuse bad input | 122 pass / 0 fail |
-| P3 information modules | `Modules-Contract.ps1` | All eight modules load, collectors work, fields exist | 318 pass / 0 fail |
-| P4 read-only audit | `Tests-ReadOnly-Audit.ps1` | PM-Quick contains no destructive path, no duplicates | 32 pass / 0 fail |
-| | | **Total** | **562 pass / 0 fail** |
-
-Two techniques are worth calling out, because they are what make the results
+Two techniques are worth calling out, because they are what made those results
 trustworthy rather than decorative:
 
-- **P1b redirects `TEMP` and `TMP`** to an empty sandbox for the child process
-  only. Every temporary file PM-Quick creates therefore lands somewhere
-  attributable, so concurrent noise from the real temp directory cannot produce
-  a false pass and a real leak cannot hide.
-- **P2 never runs the destructive engine against real user temp.**
-  `Invoke-PMCleanup` has no `-Root` parameter, so it is exercised in a child
-  process with a redirected temp, and the Recycle Bin round trip records the bin
-  count before and after and restores it exactly.
+- **P1b redirected `TEMP` and `TMP`** to an empty sandbox for the child process
+  only. Every temporary file PM-Quick created therefore landed somewhere
+  attributable, so concurrent noise from the real temp directory could not
+  produce a false pass and a real leak could not hide.
+- **P2 never ran the destructive engine against real user temp.**
+  `Invoke-PMCleanup` has no `-Root` parameter, so it was exercised in a child
+  process with a redirected temp, and the Recycle Bin round trip recorded the
+  bin count before and after and restored it exactly.
 
-Each suite writes `result-<Suite>.json` into the harness. `Clean-HarnessArtifacts.ps1`
-removes generated sample exports and is dry-run unless given `-Apply`.
+**There is no automated regression net in this repository now.** Any future
+change to `PM-Quick` or `Temp-Cleaner` has to be checked by hand. In
+particular, nothing would automatically catch a change that weakens a deletion
+guard, so re-verify the safety behaviour manually before trusting a build.
 
 ### What automation cannot cover
 
@@ -529,7 +523,7 @@ the two is recorded under Project status rather than claimed as automated.
 | Collection progress (6 steps, console + redirected) | Complete |
 | Mandatory elevation in `PM-Quick.bat` | Complete — non-elevated branch automated, UAC branch verified by hand |
 | Temp-Cleaner safety code | Complete - 7 of 11 surviving functions byte-identical to the frozen baseline; the recycle round trip was removed on purpose |
-| Automated validation | Complete — 562 assertions, 0 failures |
+| Automated validation | 562 assertions, 0 failures at v1.1. Harness since deleted, so no automated net remains |
 | Real environment validation | **Partial** — see below |
 | Release | v1.1 published. Gate was the physical run, and that was performed. |
 

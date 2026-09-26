@@ -378,34 +378,39 @@ RESULT
 - **Left untouched** — non-TEMP Recycle Bin items deliberately preserved
 - **Total cleaned** — combined reclaimed size
 
-When anything fails, a `WARNINGS` section is appended. It leads with a per-stage
-summary taken from the authoritative `Skipped` counters, then lists the
-individual failures:
+When anything is skipped, a `SKIPPED` section is appended. It leads with a
+per-stage summary taken from the authoritative `Skipped` counters, then adds one
+line per kind of reason:
 
 ```text
-WARNINGS
-  User TEMP         : 12 file(s) left untouched.
+SKIPPED
+  User TEMP         : 13 file(s) left untouched.
   Windows TEMP      : 1 file(s) left untouched.
-
-    Details:
-    [WARN] User TEMP: 'file1.tmp' - The process cannot access the file because it is being used by another process
-    [WARN] User TEMP: 'file2.tmp' - Access is denied
-    [WARN] ... and 7 more failure(s) not listed.
+    12 of those were held open by a running process. They are swept on the next run or after a restart.
+    2 could not be removed (access denied).
 ```
 
-Each detail line names the stage and the file, and quotes the real operating
-system error verbatim. Temp-Cleaner does not guess a reason category, because the
-recycle and purge APIs cannot reliably distinguish a locked file from a
-permission failure. Identical reasons are grouped into the stage summary rather
-than repeated, so a workstation with dozens of skipped files stays readable.
+Individual file names are not listed. A TEMP file that cannot be removed is not
+something that can be chased one at a time, and the names were the noisiest part
+of the output. The underlying exception text is still captured per file and
+carried in the result object, so it is available to anything consuming the
+result; only the console rendering was removed.
 
-The detail list is capped at 15 notes plus an overflow marker, so a busy
-workstation cannot flood the console. The stage summary and the per-stage
-`Skipped` counters always report the true totals, so nothing is hidden by the
-cap.
+Reasons are derived from the exception text and counted in `SkipReasons`. Two
+buckets matter:
+
+- `in-use` - a running process holds the file. Expected, needs no action, and
+  cleared by the next run or a restart.
+- `denied` and everything else - the file could not be removed for some reason
+  that may need a human.
+
+`denied` is deliberately **not** folded into the `in-use` bucket. Doing so would
+read more tidily and would be false: a permission problem does not clear on the
+next run or after a restart, which is exactly what the lock line tells the
+operator.
 
 The `Skipped / Failed` line is deliberately not called "locked": that single
-counter also covers failed recycles and failed purges.
+counter also covers failed deletions and failed purges.
 
 ---
 
@@ -487,7 +492,7 @@ powershell -ExecutionPolicy Bypass -NoProfile -File D:\myProjects\_pm-quick-vali
 | P2 sandboxed cleanup | `Test-Sandboxed-Cleanup.ps1` | Cleaner works, and its guards refuse bad input | 82 pass / 0 fail |
 | P3 information modules | `Modules-Contract.ps1` | All eight modules load, collectors work, fields exist | 309 pass / 0 fail |
 | P4 read-only audit | `Tests-ReadOnly-Audit.ps1` | PM-Quick contains no destructive path, no duplicates | 32 pass / 0 fail |
-| | | **Total** | **554 pass / 0 fail** |
+| | | **Total** | **562 pass / 0 fail** |
 
 Two techniques are worth calling out, because they are what make the results
 trustworthy rather than decorative:
@@ -522,7 +527,7 @@ unverified by machine and are not claimed to be covered.
 | Collection progress (6 steps, console + redirected) | Complete |
 | Mandatory elevation in `PM-Quick.bat` | Complete — non-elevated branch verified, UAC branch manual |
 | Temp-Cleaner safety code | Complete - 7 of 11 surviving functions byte-identical to the frozen baseline; the recycle round trip was removed on purpose |
-| Automated validation | Complete — 554 assertions, 0 failures |
+| Automated validation | Complete — 562 assertions, 0 failures |
 | Real environment validation | **Pending** — requires physical execution |
 | Release | **Blocked** until real-environment validation is signed off |
 

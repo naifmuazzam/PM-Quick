@@ -380,6 +380,30 @@ function Get-PMReportValue {
     return $prop.Value
 }
 
+function Get-PMShortSkipReason {
+    [CmdletBinding()]
+    param([string]$Reason)
+
+    if ([string]::IsNullOrWhiteSpace($Reason)) { return 'unknown' }
+
+    $r = $Reason.Trim()
+    # The raw exception text repeats the full path that was already printed as
+    # the file name, which is what made the Details block read as noise:
+    #   Access to the path 'C:\Users\...\Temp\.bdfbd97fff6f3f8c.dll' is denied.
+    if ($r -match '(?i)access to the path .+ is denied') { return 'access denied' }
+    if ($r -match '(?i)access is denied')                { return 'access denied' }
+    if ($r -match '(?i)being used by another process')   { return 'in use by another process' }
+    if ($r -match '(?i)permission')                      { return 'permission denied' }
+    if ($r -match '(?i)cannot find|no such file')        { return 'not found' }
+
+    # Anything unrecognised keeps its first sentence, minus any quoted path.
+    $first = ($r -split '(?<=\.)\s+')[0]
+    $first = [regex]::Replace($first, "'[^']*'", '')
+    $first = [regex]::Replace($first, '\s{2,}', ' ').Trim().TrimEnd('.', ',', ';')
+    if ($first.Length -gt 40) { $first = $first.Substring(0, 37).TrimEnd() + '...' }
+    return $first
+}
+
 function Format-PMCleanupReport {
     [CmdletBinding()]
     param(
@@ -474,7 +498,31 @@ function Format-PMCleanupReport {
     # Only reasons that may need a human are listed here.
     if ($warnList.Count -gt 0) {
         $rows.Add(@('DETAILHEAD', 'Details:'))
-        foreach ($w in $warnList) { $rows.Add(@('WARN', [string]$w)) }
+        # "[WARN] User TEMP: 'name' - reason" is the stored contract, so it is
+        # unpacked here rather than at the point of capture. Every line used to
+        # print as
+        #   [WARN] User TEMP: '.foo.dll' - Access to the path 'C:\...\foo.dll' is denied.
+        # which named the file twice and spent most of the line on a prefix. The
+        # stage is only shown when the list mixes stages; otherwise the per-stage
+        # counts above already say which stage a file came from.
+        $warnStages = @{}
+        foreach ($w in $warnList) {
+            $m = [regex]::Match([string]$w, '^\[WARN\]\s*(?<stage>[^:]+):')
+            if ($m.Success) { $warnStages[$m.Groups['stage'].Value] = $true }
+        }
+        $multiStage = $warnStages.Count -gt 1
+        foreach ($w in $warnList) {
+            $text = [string]$w
+            $m = [regex]::Match($text, "^\[WARN\]\s*(?<stage>[^:]+):\s*'(?<name>[^']*)'\s*-\s*(?<reason>.*)$")
+            if (-not $m.Success) {
+                # The truncation notice has no stage/name to unpack.
+                $rows.Add(@('WARN', $text))
+                continue
+            }
+            $label = $m.Groups['name'].Value
+            if ($multiStage) { $label = $m.Groups['stage'].Value.Trim() + ' ' + $label }
+            $rows.Add(@('WARN', $label, (Get-PMShortSkipReason $m.Groups['reason'].Value)))
+        }
     }
 
     $out = New-Object System.Collections.Generic.List[string]
@@ -486,7 +534,10 @@ function Format-PMCleanupReport {
             'FIELD'      { $out.Add(('  {0,-18}: {1}' -f $row[1], $row[2])) }
             'DETAIL'     { $out.Add(('    ' + $row[1])) }
             'DETAILHEAD' { $out.Add(''); $out.Add(('    ' + $row[1])) }
-            'WARN'       { $out.Add(('    ' + $row[1])) }
+            'WARN' {
+                if ($row.Count -ge 3) { $out.Add(('      {0,-32} {1}' -f $row[1], $row[2])) }
+                else                 { $out.Add(('    ' + $row[1])) }
+            }
         }
     }
 

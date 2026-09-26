@@ -478,6 +478,11 @@ if ($summary) {
 # ============================================================================
 # OPTIONAL LOCAL JSON EXPORT
 # ============================================================================
+# Tracked so the footer can stay truthful. An unconditional "nothing was
+# changed" would be a false claim in exactly the mode that writes a file.
+$exportedReport = $null
+$exportAttempted = [bool]$Json
+
 if ($Json) {
     try {
         # Default into the project's own output directory, never anywhere else.
@@ -486,6 +491,7 @@ if ($Json) {
         }
 
         $saved = Export-PMInspectionJson -Inspection $inspection -Path $Json
+        $exportedReport = $saved
         Write-Host ""
         Write-Host "  Report saved locally: $saved" -ForegroundColor Green
         Write-Host "  (local file only - nothing was uploaded)" -ForegroundColor DarkGray
@@ -500,8 +506,20 @@ if ($Json) {
 # ============================================================================
 Write-Host ""
 Write-Host "  ========================================" -ForegroundColor Cyan
-Write-Host "  Read-only report complete. Nothing was" -ForegroundColor DarkGray
-Write-Host "  changed, deleted or uploaded." -ForegroundColor DarkGray
+Write-Host "  Read-only report complete." -ForegroundColor DarkGray
+if ($exportedReport) {
+    # One file was written, by request. Say so rather than claiming otherwise.
+    Write-Host "  No existing file, setting or data was changed, and" -ForegroundColor DarkGray
+    Write-Host "  nothing was deleted or uploaded. The only file written" -ForegroundColor DarkGray
+    Write-Host "  was the report you requested:" -ForegroundColor DarkGray
+    Write-Host "    $exportedReport" -ForegroundColor DarkGray
+} elseif ($exportAttempted) {
+    Write-Host "  Nothing was changed, deleted or uploaded, but the" -ForegroundColor DarkGray
+    Write-Host "  requested JSON export FAILED, so no report file was" -ForegroundColor DarkGray
+    Write-Host "  written." -ForegroundColor DarkGray
+} else {
+    Write-Host "  Nothing was changed, deleted or uploaded." -ForegroundColor DarkGray
+}
 Write-Host "  For TEMP/Recycle Bin cleanup run Temp-Cleaner.bat" -ForegroundColor DarkGray
 Write-Host "  ========================================" -ForegroundColor Cyan
 Write-Host ""

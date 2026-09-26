@@ -163,6 +163,23 @@ The file is written to `output\report.json` inside the project. It is written
 locally and **nowhere else**: no upload, no API, no telemetry. The `output\`
 directory is git-ignored. This is the only path PM-Quick will ever write to.
 
+The closing summary adapts to what actually happened, because a footer that
+overstates its own safety is worse than no footer:
+
+```text
+  Read-only report complete.
+  Nothing was changed, deleted or uploaded.          <- plain run
+
+  Read-only report complete.
+  No existing file, setting or data was changed, and  <- with -Json
+  nothing was deleted or uploaded. The only file written
+  was the report you requested:
+    D:\myProjects\PM-Quick\output\report.json
+```
+
+If the requested export fails, the footer says so instead of claiming nothing
+was written.
+
 ---
 
 ## 6. Modules
@@ -423,11 +440,11 @@ powershell -ExecutionPolicy Bypass -NoProfile -File D:\myProjects\_pm-quick-vali
 | Suite | Script | Scope | Result |
 |---|---|---|---|
 | P1a function parity | `Test-Function-Parity.ps1` | Destructive code moved from the frozen baseline unchanged | 43 pass / 0 fail |
-| P1b runtime read-only | `Test-Runtime-ReadOnly.ps1` | Runs PM-Quick and proves it changes nothing on disk | 38 pass / 0 fail |
+| P1b runtime read-only | `Test-Runtime-ReadOnly.ps1` | Runs PM-Quick and proves it changes nothing on disk | 43 pass / 0 fail |
 | P2 sandboxed cleanup | `Test-Sandboxed-Cleanup.ps1` | Cleaner works, and its guards refuse bad input | 82 pass / 0 fail |
 | P3 information modules | `Modules-Contract.ps1` | All eight modules load, collectors work, fields exist | 240 pass / 0 fail |
 | P4 read-only audit | `Tests-ReadOnly-Audit.ps1` | PM-Quick contains no destructive path, no duplicates | 32 pass / 0 fail |
-| | | **Total** | **435 pass / 0 fail** |
+| | | **Total** | **440 pass / 0 fail** |
 
 Two techniques are worth calling out, because they are what make the results
 trustworthy rather than decorative:
@@ -462,7 +479,7 @@ unverified by machine and are not claimed to be covered.
 | Collection progress (6 steps, console + redirected) | Complete |
 | Mandatory elevation in `PM-Quick.bat` | Complete — non-elevated branch verified, UAC branch manual |
 | Temp-Cleaner safety code | Complete — moved from the frozen baseline, 10 of 13 functions byte-identical |
-| Automated validation | Complete — 435 assertions, 0 failures |
+| Automated validation | Complete — 440 assertions, 0 failures |
 | Real environment validation | **Pending** — requires physical execution |
 | Release | **Blocked** until real-environment validation is signed off |
 

@@ -1,3 +1,52 @@
+<#
+.SYNOPSIS
+    Temp-Cleaner - TEMP and Recycle Bin maintenance for IT technicians.
+
+.DESCRIPTION
+    The destructive half of the old PM-Quick tool, split out so that PM-Quick
+    itself is strictly read-only.
+
+    This tool cleans three things, in this order:
+      1. User TEMP     - files are sent to the Recycle Bin, not deleted
+      2. Windows TEMP  - files are sent to the Recycle Bin, not deleted
+      3. Recycle Bin   - ONLY items whose original source is proven to be a
+                         TEMP directory are permanently purged
+
+    Everything else in the Recycle Bin - Desktop, Documents, Downloads and any
+    item whose source cannot be resolved - is reported and left untouched.
+
+    The safety code below is the code that shipped in PM-Quick and passed
+    automated safety regression. It was moved, not rewritten. The only change is
+    documented in Get-TempTreeSafe: a root that is not an absolute path is now
+    refused, because Windows strips trailing spaces from a path, so a
+    whitespace-only root such as '   ' silently collapses to the current
+    directory.
+
+.NOTES
+    Requires Windows PowerShell 5.1 and Administrator.
+    Requires: -RunAsAdministrator is declared below.
+
+    Safety guarantees (all covered by the regression suite):
+      - The Recycle Bin is never emptied wholesale
+      - No permanent-delete fallback: if recycling fails, the file stays put
+      - Locked and inaccessible files are left untouched and reported
+      - Junctions, symlinks and other reparse points are never traversed
+      - Path boundary checks are strict, so '...\TempEvil' never matches
+        '...\Temp'
+      - Permanent deletion is confined to one guarded helper that refuses any
+        path outside the Recycle Bin
+      - Nothing is deleted without an explicit Y or y
+#>
+
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# ============================================================================
+# SAFETY CODE - moved verbatim from the frozen PM-Quick Cleanup.ps1
+# ============================================================================
+
 function Get-TempTreeSafe {
     [CmdletBinding()]
     param(
@@ -7,7 +56,29 @@ function Get-TempTreeSafe {
     $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
     $dirs  = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
 
-    if ($Root -and (Test-Path -LiteralPath $Root -PathType Container -ErrorAction SilentlyContinue)) {
+    # HARDENING (the only behavioural change to the moved safety code).
+    # A root that is not a fully-qualified absolute path is refused outright.
+    # Windows strips trailing spaces from a path, so a whitespace-only root such
+    # as '   ' silently collapses to the CURRENT DIRECTORY - and a relative root
+    # is resolved against whatever the working directory happens to be. For a
+    # destructive caller either case means collecting the wrong tree.
+    #
+    # [System.IO.Path]::IsPathRooted is NOT sufficient on its own: it returns
+    # True for a drive-relative path such as 'C:' or 'C:Temp', which resolves
+    # against that drive's current directory rather than naming a real folder.
+    # Left unchecked, a root of 'C:' walks the entire drive - measured at over
+    # a million entries. A usable root must therefore name a drive or UNC share
+    # AND a first-level directory, which is what the pattern below requires.
+    $rootIsAbsolute = $false
+    if ($Root) {
+        try {
+            $candidate = "$Root".Trim()
+            # 'C:\...' or 'C:/...' for a local drive, '\\server\share' for UNC.
+            $rootIsAbsolute = ($candidate -match '^[A-Za-z]:[\\/]') -or ($candidate -match '^\\\\[^\\/]+[\\/][^\\/]+')
+        } catch { $rootIsAbsolute = $false }
+    }
+
+    if ($rootIsAbsolute -and (Test-Path -LiteralPath $Root -PathType Container -ErrorAction SilentlyContinue)) {
         $stack = New-Object System.Collections.Generic.Stack[string]
         $stack.Push((Resolve-Path -LiteralPath $Root -ErrorAction SilentlyContinue).ProviderPath)
 
@@ -41,8 +112,18 @@ function Get-DirectorySize {
     param([string]$Path)
 
     if (-not (Test-Path $Path)) { return 0 }
-    (Get-TempTreeSafe -Root $Path).Files |
-        Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue | ForEach-Object { $_.Sum }
+
+    # NOTE: this is a reporting-only value. It is used solely for the
+    # Before/After figures and the preview sizes, and never gates a delete, so
+    # the empty-tree case below is cosmetic. Measure-Object emits nothing at all
+    # on an empty pipeline, which used to make this function return $null for an
+    # existing-but-empty directory; it now returns a real 0.
+    $sum = (Get-TempTreeSafe -Root $Path).Files |
+        Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Sum }
+
+    if ($null -eq $sum) { return 0 }
+    return $sum
 }
 
 function Get-TempCleanupEstimate {
@@ -594,7 +675,202 @@ function Invoke-PMCleanup {
     if ($warningTotal -gt $warnings.Count) {
         $warnings.Add("[WARN] ... and $($warningTotal - $warnings.Count) more failure(s) not listed.")
     }
-    $summary.Warnings = @($warnings)
+    # .ToArray(), not @($warnings): on Windows PowerShell 5.1 @() around a List
+    # yields a one-element array holding the List, so the WARNINGS section would
+    # print the collection object instead of the individual warning rows.
+    $summary.Warnings = $warnings.ToArray()
+
 
     [pscustomobject]$summary
+}
+# Decides what a single answer to the cleanup confirmation means.
+# Deliberately total and side-effect free: only a literal Y/y can ever
+# authorise the destructive action, so stray or buffered keystrokes - including
+# a bare Enter - can never be read as consent.
+function Get-PMConfirmDecision {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Answer
+    )
+
+    # Enter, or anything with no non-whitespace content, is not consent.
+    if ($null -eq $Answer) { return 'RETRY' }
+    $normalized = $Answer.Trim()
+    if ($normalized.Length -eq 0) { return 'RETRY' }
+
+    if ($normalized -ceq 'Y' -or $normalized -ceq 'y') { return 'PROCEED' }
+    if ($normalized -ceq 'N' -or $normalized -ceq 'n') { return 'ABORT' }
+
+    # Anything else is invalid input: re-prompt, never assume consent.
+    return 'RETRY'
+}
+
+# ============================================================================
+# USER INTERFACE
+# ============================================================================
+
+
+function Write-TCSectionHeader {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host "  $Title" -ForegroundColor Cyan
+    Write-Host "  $('=' * 40)" -ForegroundColor DarkGray
+}
+
+function Write-TCField {
+    param(
+        [string]$Label,
+        [string]$Value,
+        [int]$LabelWidth = 18
+    )
+    $padded = $Label.PadRight($LabelWidth)
+    Write-Host "  $padded" -NoNewline
+    Write-Host $Value
+}
+
+function Invoke-TempCleanerUI {
+    [CmdletBinding()]
+    param()
+
+    # Keep the console buffer wide enough that a resize does not leave a
+    # scrollbar artifact over the report.
+    try {
+        $host.UI.RawUI.WindowTitle = 'Temp-Cleaner'
+        $minWidth = 120
+        $curBufW = $host.UI.RawUI.BufferSize.Width
+        $curWinW = $host.UI.RawUI.WindowSize.Width
+        $targetW = [Math]::Max($minWidth, $curWinW)
+        if ($curBufW -lt $targetW) {
+            $host.UI.RawUI.BufferSize = [System.Management.Automation.Host.Size]::new($targetW, 3000)
+        }
+    } catch {}
+
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ========================================" -ForegroundColor Yellow
+    Write-Host "            TEMP CLEANER" -ForegroundColor Yellow
+    Write-Host "  ========================================" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  This tool DELETES files. PM-Quick does not." -ForegroundColor DarkGray
+    Write-Host "  Collecting preview..." -ForegroundColor DarkGray
+
+    # ---------------------------------------------------------------- preview
+    Write-TCSectionHeader 'CLEANUP PREVIEW'
+
+    $estimate = $null
+    try { $estimate = Get-TempCleanupEstimate } catch {}
+
+    if ($estimate) {
+        foreach ($item in $estimate.Items) {
+            Write-TCField $item.Location "$($item.SizeMB) MB"
+        }
+
+        # Spell out exactly what will and will not be touched, before asking.
+        $tempOrigin  = @($estimate.RecycleBin | Where-Object { $_.IsTempSource -eq $true })
+        $nonTemp     = @($estimate.RecycleBin | Where-Object { $_.IsTempSource -ne $true })
+        $unknown     = @($estimate.RecycleBin | Where-Object { $_.SourceReliable -ne $true })
+
+        Write-Host ""
+        Write-TCField 'Recycle Bin TEMP'    "$($tempOrigin.Count) item(s) will be purged"
+        Write-TCField 'Left untouched'      "$($nonTemp.Count) item(s)"
+
+        if ($unknown.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  $($unknown.Count) Recycle Bin item(s) have an unreadable source path" -ForegroundColor Yellow
+            Write-Host "  and will be left untouched." -ForegroundColor Yellow
+        }
+
+        if ($nonTemp.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  Recycle Bin: $($nonTemp.Count) non-TEMP item(s) will be left untouched." -ForegroundColor DarkGray
+            Write-Host "  Desktop, Documents, Downloads and unknown origins are never purged." -ForegroundColor DarkGray
+        }
+    } else {
+        Write-TCField 'Cleanup' 'N/A - Could not estimate'
+    }
+
+    # ----------------------------------------------------------- confirmation
+    # Only an explicit Y or y may cross this gate. Enter, whitespace and any
+    # other input re-prompt instead of defaulting to cleanup.
+    Write-Host ""
+    Write-Host "  WARNING: this permanently removes TEMP files." -ForegroundColor Red
+
+    $runCleanup = $false
+    while ($true) {
+        Write-Host "  Proceed with cleanup? [Y/N]: " -NoNewline -ForegroundColor Yellow
+        $decision = Get-PMConfirmDecision -Answer (Read-Host)
+
+        if ($decision -eq 'PROCEED') { $runCleanup = $true; break }
+        if ($decision -eq 'ABORT')  { $runCleanup = $false; break }
+
+        Write-Host "  Please enter Y or N." -ForegroundColor Yellow
+    }
+
+    if (-not $runCleanup) {
+        Write-Host ""
+        Write-Host "  Cleanup cancelled. Nothing was deleted." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  ========================================" -ForegroundColor Yellow
+        Write-Host "          CLEANUP CANCELLED" -ForegroundColor Yellow
+        Write-Host "  ========================================" -ForegroundColor Yellow
+        Write-Host ""
+        return
+    }
+
+    # ---------------------------------------------------------------- cleanup
+    Write-Host ""
+    Write-Host "  Running cleanup..." -ForegroundColor DarkGray
+    Write-TCField 'User TEMP'     'Cleaning...'
+    Write-TCField 'Windows TEMP'  'Cleaning...'
+    Write-TCField 'Recycle Bin'   'Cleaning...'
+
+    $cleanupResult = $null
+    $cleanupError  = $null
+    try { $cleanupResult = Invoke-PMCleanup } catch { $cleanupError = $_ }
+
+    if ($cleanupResult) {
+        Write-Host ""
+        Write-TCField 'User TEMP'    $cleanupResult.UserTempCleaned
+        Write-TCField 'Windows TEMP' $cleanupResult.WinTempCleaned
+        Write-TCField 'Recycle Bin'  $cleanupResult.RecycleCleaned
+
+        # Legacy counter: covers locked files, failed recycles and failed purges
+        # alike, so it is not reported as "locked" specifically. The per-stage
+        # breakdown below is the authoritative detail.
+        if ($cleanupResult.FilesSkipped -gt 0) {
+            Write-TCField 'Skipped / Failed' "$($cleanupResult.FilesSkipped) items"
+        }
+        if ($cleanupResult.TempFilesSkipped -gt 0) {
+            Write-TCField 'Skipped (non-TEMP)' "$($cleanupResult.TempFilesSkipped) items"
+        }
+
+        # Detailed per-location report. Purely additive: the fields above keep
+        # their original names, order and meaning.
+        try {
+            Write-Host ""
+            Format-PMCleanupReport -Result $cleanupResult | ForEach-Object { Write-Host $_ }
+        } catch {}
+    } else {
+        Write-Host "  Cleanup failed or was interrupted." -ForegroundColor Red
+        if ($cleanupError) {
+            Write-Host "  Reason: $($cleanupError.Exception.Message)" -ForegroundColor Red
+        }
+    }
+
+    # ----------------------------------------------------------------- footer
+    Write-Host ""
+    Write-Host "  ========================================" -ForegroundColor Yellow
+    Write-Host "          CLEANUP COMPLETE" -ForegroundColor Yellow
+    Write-Host "  ========================================" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+# Guarded so the safety functions above can be dot-sourced by the regression
+# suite without the interactive flow running.
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-TempCleanerUI
 }

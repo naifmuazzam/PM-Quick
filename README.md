@@ -1,8 +1,8 @@
 # PM Quick Tool
 
-A lightweight, local-only Windows preventive maintenance helper for IT
+A lightweight, local-only Windows inspection and maintenance helper for IT
 technicians. Built on Windows PowerShell 5.1 to speed up the existing technician
-PM workflow: gather the workstation facts, clean TEMP safely, then enter the
+PM workflow: gather the workstation facts, report on their health, then enter the
 relevant results into MyERP by hand.
 
 **PM-Quick does not connect to MyERP.** There is no MyERP API, no database, no
@@ -11,26 +11,52 @@ a human to read.
 
 ---
 
-## 1. Project overview
+## 1. Two separate tools
 
-PM-Quick runs on the technician's workstation, collects read-only hardware and
-system inventory, and optionally performs a guarded TEMP cleanup. It is a
-reporting and cleanup aid — it deliberately does not change system
-configuration.
+This project ships **two independent tools**, split by a hard safety boundary.
+
+| Tool | Script | Can it delete anything? |
+|---|---|---|
+| **PM-Quick** | `PM-Quick.bat` / `PM-Quick.ps1` | **No. Strictly read-only.** |
+| **Temp-Cleaner** | `Temp-Cleaner\Temp-Cleaner.bat` / `.ps1` | Yes — TEMP and Recycle Bin only |
+
+PM-Quick contains no deletion, no recycling, no Recycle Bin access and no
+cleanup path at all. All destructive code lives in Temp-Cleaner.
+
+> **Do not merge these back together.** The split is the safety model, not a
+> packaging preference. It exists so a read-only inspection can be run on a
+> machine by anyone, without an elevation prompt and without any possibility of
+> data loss.
+
+---
+
+## 2. Project overview
+
+PM-Quick runs on the technician's workstation and collects a read-only hardware,
+system, network, storage and health inventory, then prints a report. It
+deliberately does not change system configuration.
 
 What it does:
 
-- Reports PC name, BIOS serial, Windows edition/build and logged-on user
-- Reports every IPv4 address on active physical adapters, with **no**
-  auto-selection
-- Samples CPU and memory usage
-- Reports per-drive capacity, free space, media type and internal/external
-- Reports SSD health and estimated life where the hardware exposes reliable data
-- Previews and optionally performs TEMP cleanup with Recycle Bin source
-  validation
+- Reports PC name, manufacturer, model, BIOS serial, device type, Windows
+  edition/build, architecture, logged-on user and uptime
+- Reports CPU, core/thread counts and clocks
+- Reports total RAM, form factor, speed and per-module detail
+- Reports GPU name, VRAM and driver version
+- Reports motherboard and physical disk hardware
+- Reports every network adapter with its state, type, MAC and addresses, and
+  never auto-selects a single "the" address
+- Reports per-drive total, used and free space with a **free-space percentage**
+- Reports disk SMART status and SSD wear where the hardware exposes it
+- Runs health checks: battery, TPM, Secure Boot/VBS, pending reboot, disk space,
+  disk health, SSD wear
+- Prints a technician summary with recommended actions
+- Optionally writes the same data to a **local** JSON file
 
 What it does not do:
 
+- Delete, move or rename any file
+- Read, enumerate or empty the Recycle Bin
 - No MyERP integration of any kind
 - No registry, service, network or Windows Update changes
 - No outbound network traffic, cloud services or analytics
@@ -38,7 +64,7 @@ What it does not do:
 
 ---
 
-## 2. Current workflow
+## 3. Current workflow
 
 ```text
 Technician
@@ -50,8 +76,11 @@ PM-Quick.bat
 PM-Quick.ps1
     |
     v
-System / Network / Performance /
-Storage / SSD / Cleanup
+System / Hardware / Network / Performance /
+Storage / SSD / Health / Report
+    |
+    v
+PM-Quick prints report + summary + recommended actions
     |
     v
 Technician reviews result
@@ -64,44 +93,38 @@ PM-Quick produces the material. The MyERP entry stays a manual, human step.
 
 ---
 
-## 3. Requirements
+## 4. Requirements
 
 | Requirement | Detail |
 |---|---|
 | Operating system | Windows 10 or Windows 11 |
 | PowerShell | Windows PowerShell **5.1** (Desktop edition) |
-| Privileges | Administrator. `PM-Quick.bat` self-elevates; `PM-Quick.ps1` declares `#Requires -RunAsAdministrator` |
+| Privileges | PM-Quick: optional, but Administrator is recommended. Temp-Cleaner: **required** |
 | Dependencies | None to install — see below |
 
-Everything PM-Quick uses ships with Windows:
+Everything used ships with Windows:
 
 | Dependency | Used for | Provided by |
 |---|---|---|
-| `Get-CimInstance` | system, OS, network fallback, SMART, storage fallback | `CimCmdlets` (built in) |
-| `Get-NetAdapter`, `Get-NetIPAddress` | adapter and IPv4 enumeration | `NetAdapter`, `NetTCPIP` (built in) |
+| `Get-CimInstance` | system, hardware, OS, network, SMART, storage, TPM, VBS | `CimCmdlets` (built in) |
 | `Get-Counter` | CPU sampling | `Microsoft.PowerShell.Diagnostics` (built in) |
 | `Get-Volume`, `Get-Partition`, `Get-Disk`, `Get-PhysicalDisk`, `Get-StorageReliabilityCounter` | storage and SSD inventory | `Storage` (built in) |
-| `Microsoft.VisualBasic` assembly | Recycle Bin send and permanent purge | .NET Framework (built in) |
-| `Shell.Application` COM object | Recycle Bin enumeration and source classification | Windows shell (built in) |
+| `Microsoft.VisualBasic` assembly | Recycle Bin send and permanent purge — **Temp-Cleaner only** | .NET Framework (built in) |
+| `Shell.Application` COM object | Recycle Bin enumeration and source classification — **Temp-Cleaner only** | Windows shell (built in) |
 
 **PowerShell 7 has not been validated.** Do not assume `pwsh` compatibility.
 
 ---
 
-## 4. Running PM-Quick
+## 5. Running PM-Quick
 
-Double-click `PM-Quick.bat`. It probes for elevation, re-launches itself elevated
-if needed, and then runs the main script:
+Double-click `PM-Quick.bat`. The launcher **always elevates to Administrator**,
+so a UAC prompt is expected every run. Elevation is not cosmetic: TPM state,
+disk SMART and some firmware values are only readable as Administrator, and a
+non-elevated run reports them as `N/A` rather than guessing.
 
-```text
-PM-Quick.bat
-    -> net session probe
-    -> if not elevated: powershell Start-Process -Verb RunAs (re-launches .bat)
-    -> powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0PM-Quick.ps1"
-    -> pause
-```
-
-The equivalent direct invocation, from an already-elevated PowerShell window:
+From a PowerShell window you can bypass the launcher and call the script
+directly. This does **not** elevate:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -NoProfile -File .\PM-Quick.ps1
@@ -110,11 +133,69 @@ powershell -ExecutionPolicy Bypass -NoProfile -File .\PM-Quick.ps1
 `ExecutionPolicy Bypass` is scoped to that one process; it does not change the
 machine or user execution policy.
 
-The script collects all sections first, shows a cleanup preview, then asks
-`Proceed with cleanup? [Y/N]`. Answering `N` deletes nothing.
+Anything unreadable is reported as `N/A` or `Unknown` — never guessed.
 
-Cleanup confirmation requires an explicit `Y` or `y`. Empty or invalid input
-does not proceed with cleanup.
+### Collection progress
+
+Collection runs in six numbered steps and reports progress while it works:
+
+```text
+Step 1/6 [##----------------]  17%  System identity            0.2s
+...
+Step 6/6 [####################] 100%  Health checks             1.1s
+
+Collection finished in 15.0s
+```
+
+In an interactive console the bar redraws in place on a single line. When output
+is redirected — piped to a file, or captured by a test harness — the same
+progress is emitted as plain lines with no ANSI escape codes, so logs stay
+readable. Collection warnings are buffered and printed after the summary rather
+than interleaved with the progress bar.
+
+### Optional local JSON export
+
+```powershell
+powershell -ExecutionPolicy Bypass -NoProfile -File .\PM-Quick.ps1 -Json report.json
+```
+
+The file is written to `output\report.json` inside the project. It is written
+locally and **nowhere else**: no upload, no API, no telemetry. The `output\`
+directory is git-ignored. This is the only path PM-Quick will ever write to.
+
+---
+
+## 6. Modules
+
+| Module | Public function | Purpose |
+|---|---|---|
+| `modules/System.ps1` | `Get-PMSystemInfo`, `Get-PMDeviceType` | PC name, manufacturer, model, BIOS serial, Windows edition/build, architecture, user, uptime; Desktop vs Laptop from chassis/PCSystemType/battery evidence |
+| `modules/Hardware.ps1` | `Get-PMHardwareInfo` | CPU, RAM (total, slots, speed, form factor, per-module), GPU, motherboard, physical disks |
+| `modules/Network.ps1` | `Get-PMNetworkInfo` | Every adapter with type, state, MAC, DHCP, speed, addresses; gateway and DNS |
+| `modules/Performance.ps1` | `Get-PMPerformanceSnapshot` | Short CPU sample plus an instant memory reading |
+| `modules/Storage.ps1` | `Get-PMStorageInfo` | Per-drive total/used/free and free percentage, physical disk SMART status, low-space detection |
+| `modules/SSD.ps1` | `Get-PMSSDHealth` | SSD health, wear, estimated life, temperature; SMART fallback |
+| `modules/Health.ps1` | `Get-PMHealthCheck` | Battery, TPM, Secure Boot/VBS, pending reboot, disk space, disk health, SSD wear |
+| `modules/Report.ps1` | `Get-PMSummaryText`, `Get-PMRecommendations`, `Export-PMInspectionJson` | Console rendering, technician summary, recommendations, local JSON |
+
+All eight modules are strictly read-only.
+
+---
+
+## 7. Running Temp-Cleaner
+
+Double-click `Temp-Cleaner\Temp-Cleaner.bat`. It self-elevates, shows a preview,
+and asks `Proceed with cleanup? [Y/N]`.
+
+```text
+Temp-Cleaner.bat
+    -> net session probe
+    -> if not elevated: Start-Process -Verb RunAs (re-launches .bat)
+    -> powershell -File "%~dp0Temp-Cleaner.ps1"
+    -> pause
+```
+
+### Confirmation
 
 | Input | Result |
 |---|---|
@@ -124,29 +205,14 @@ does not proceed with cleanup.
 | whitespace only | does not proceed, re-prompts |
 | anything else | does not proceed, re-prompts |
 
-An accidental or buffered keystroke - including a stray Enter pressed while
-reading an earlier section - can therefore never authorise a destructive
-cleanup. Invalid input prints `Please enter Y or N.` and asks again.
+Only an explicit `Y` or `y` authorises cleanup. Enter, whitespace and any other
+input re-prompt instead of defaulting to cleanup, so a stray or buffered
+keystroke — including a bare Enter pressed while reading an earlier section —
+can never authorise a destructive action.
 
 ---
 
-## 5. Modules
-
-| Module | Public function | Purpose |
-|---|---|---|
-| `modules/System.ps1` | `Get-PMSystemInfo` | PC name, BIOS serial, Windows edition/build, logged-on user |
-| `modules/Network.ps1` | `Get-PMNetworkInfo` | IPv4 addresses on up, non-virtual adapters; CIM fallback |
-| `modules/Performance.ps1` | `Get-PMPerformanceSnapshot` | Short CPU sample plus an instant memory reading |
-| `modules/Storage.ps1` | `Get-PMStorageInfo` | Per-drive total/free size, media type, internal vs external |
-| `modules/SSD.ps1` | `Get-PMSSDHealth` | SSD health, wear, estimated life, temperature; SMART fallback |
-| `modules/Cleanup.ps1` | `Invoke-PMCleanup`, `Get-TempCleanupEstimate`, and helpers | TEMP cleanup, Recycle Bin source validation, reporting |
-
-The five information modules are strictly read-only. `Cleanup.ps1` is the only
-module that deletes anything.
-
----
-
-## 6. Cleanup safety model
+## 8. Cleanup safety model
 
 Cleanup runs in three ordered stages. Each stage only ever removes files whose
 original source has been proven to be a TEMP directory.
@@ -193,14 +259,18 @@ Guarantees:
   junction or symlink, so cleanup cannot escape the TEMP tree or delete through
   a link.
 - **The Recycle Bin is never emptied wholesale.** There is no call to empty,
-  clear or shell-empties the Recycle Bin.
+  clear or shell-empty the Recycle Bin.
 - **No permanent-delete fallback.** If recycling a file fails, the file stays
   where it is. There is no path that escalates a recycle failure into a
   permanent delete.
+- **Root paths must be absolute.** `Get-TempTreeSafe` refuses a non-absolute
+  root outright. Windows strips trailing spaces from a path, so a
+  whitespace-only root such as `"   "` silently collapses to the current
+  directory; for a destructive caller that would mean collecting the wrong
+  tree. Every legitimate root (`$env:TEMP`, `%SystemRoot%\Temp`) is absolute, so
+  this refuses nothing real.
 - **Confirmation is required.** Nothing is deleted unless the technician types an
-  explicit `Y` or `y`. Enter, whitespace, and any other input re-prompt instead
-  of defaulting to cleanup, so stray or buffered keystrokes can never authorise a
-  destructive action.
+  explicit `Y` or `y`.
 
 Permanent deletion is confined to a single guarded helper that refuses any path
 outside the Recycle Bin, and it is reached only from Stage C for items already
@@ -208,7 +278,7 @@ classified as TEMP-origin. Do not relax that guard.
 
 ---
 
-## 7. Reporting
+## 9. Reporting
 
 A cleanup run prints a summary line per location, then a detailed report.
 
@@ -264,7 +334,7 @@ WARNINGS
 ```
 
 Each detail line names the stage and the file, and quotes the real operating
-system error verbatim. PM-Quick does not guess a reason category, because the
+system error verbatim. Temp-Cleaner does not guess a reason category, because the
 recycle and purge APIs cannot reliably distinguish a locked file from a
 permission failure. Identical reasons are grouped into the stage summary rather
 than repeated, so a workstation with dozens of skipped files stays readable.
@@ -279,10 +349,10 @@ counter also covers failed recycles and failed purges.
 
 ---
 
-## 8. DryRun
+## 10. DryRun
 
-`Invoke-PMCleanup` supports a `-DryRun` switch. In dry-run mode PM-Quick performs
-the full safe traversal and reports exactly what it *would* do, but:
+`Invoke-PMCleanup` supports a `-DryRun` switch. In dry-run mode Temp-Cleaner
+performs the full safe traversal and reports exactly what it *would* do, but:
 
 - no file is recycled
 - no file is permanently deleted
@@ -290,108 +360,124 @@ the full safe traversal and reports exactly what it *would* do, but:
 - the report is titled `=== PM CLEANUP (DRY RUN) ===` and states
   `No files were recycled or permanently deleted.`
 
-Invoke it directly against the module:
+Invoke it directly against the script:
 
 ```powershell
-. ".\modules\Cleanup.ps1"
+. ".\Temp-Cleaner\Temp-Cleaner.ps1"
 Invoke-PMCleanup -DryRun
 ```
 
-The interactive `PM-Quick.bat` flow previews sizes and asks for confirmation; it
-does not currently expose a DryRun menu entry.
+The script is dot-sourceable without running the interactive flow, because the
+entry point is guarded by an `if ($MyInvocation.InvocationName -ne '.')` check.
 
 ---
 
-## 9. Limitations
+## 11. Limitations
 
 Real constraints discovered during development.
 
 - **Recycle Bin quota.** Windows may permanently delete a file at the moment it
   is sent to the Recycle Bin if that file exceeds the Recycle Bin or volume
-  quota. PM-Quick does not override operating-system Recycle Bin policy and
+  quota. Temp-Cleaner does not override operating-system Recycle Bin policy and
   cannot guarantee that any individual file remains recoverable. Recycling in
   Stage A is a safety step, not a backup.
 - **Locked files are never force-deleted.** Files held by running services stay
   in TEMP until released.
+- **GPU VRAM is often `N/A`.** `Win32_VideoController.AdapterRAM` is a signed
+  32-bit field, so a modern GPU overflows it. A negative or implausible value is
+  reported as `N/A` rather than as a wrong number.
 - **SSD estimated life is often `N/A`.** Many consumer SATA SSDs report
-  `Wear = 0%`, meaning "not reported" rather than "brand new". PM-Quick shows
-  `N/A` rather than a misleading figure.
-- **Virtual adapter filtering is name-based.** An adapter with a non-standard
-  name may not be filtered out, and may appear in the IPv4 list.
+  `Wear = 0%`, meaning "not reported" rather than "brand new".
+- **Disk serials are often blank** without Administrator, and are reported as
+  `N/A`.
+- **RAM slot count is often `N/A`.** Most desktops do not expose a physical slot
+  count through WMI.
+- **Device type can be `Unknown`.** It is derived from chassis, `PCSystemType` and
+  battery presence, never from the PC name. The evidence is printed so a
+  technician can see how the call was made.
 - **Multiple IPv4 addresses are all shown.** PM-Quick does not choose one. The
   technician must confirm the correct address in MyERP.
 - **Complex RAID or Storage Spaces** configurations may not map drive letters
-  cleanly, so a drive may be reported without a size or media type.
+  cleanly, so a drive may be reported without a size.
 - **The cleanup preview is a sample.** Sizes are measured at preview time and
   may differ slightly by the time cleanup runs.
 - **PowerShell 7 is untested.** Use Windows PowerShell 5.1.
 
 ---
 
-## 10. Testing
+## 12. Testing
 
-### Automated / local validation — complete
+Validation runs from a **durable harness outside the repository**, so no test
+artefact can ever be committed by accident:
 
-Executed on a Windows 10 Pro 19045 development host with Windows PowerShell
-5.1.19041.6456. All suites run outside the repository so no test artefact can be
-committed by accident.
+```text
+D:\myProjects\_pm-quick-validation\
+```
 
-| Suite | Result |
-|---|---|
-| P1 safety regression | **68 PASS / 0 FAIL** |
-| P2 result/reporting contract | **110 PASS / 0 FAIL** |
-| P3 UX, warnings, confirmation and DryRun | **113 PASS / 0 FAIL** |
-| P4 information modules | **57 PASS / 0 FAIL** |
-| PowerShell 5.1 parser, all 7 scripts | **0 parse errors** |
-| Module load, all 6 modules | **6/6 clean** |
-| P1 safety functions vs `HEAD` | **7/7 byte-identical** |
-| Forbidden-pattern safety audit | **0 findings** |
+Run everything with one command:
 
-Coverage highlights: the `...\Temp` vs `...\TempEvil` prefix trap, `.`/`..`
-resolution, malformed and null-byte paths, a real NTFS junction with a canary
-file, a genuinely locked file, non-TEMP Recycle Bin survival, Stage A → B → C
-ordering, result-property types and ordering, the warning cap, and DryRun
-inertness. The five information modules are proven read-only by static scan: no
-mutating cmdlet, no network call, no registry or service change.
+```powershell
+powershell -ExecutionPolicy Bypass -NoProfile -File D:\myProjects\_pm-quick-validation\Run-Gauntlet.ps1
+```
 
-Full detail, including the safety audit, is in
-[`docs/P4-VALIDATION.md`](docs/P4-VALIDATION.md).
+| Suite | Script | Scope | Result |
+|---|---|---|---|
+| P1a function parity | `Test-Function-Parity.ps1` | Destructive code moved from the frozen baseline unchanged | 43 pass / 0 fail |
+| P1b runtime read-only | `Test-Runtime-ReadOnly.ps1` | Runs PM-Quick and proves it changes nothing on disk | 38 pass / 0 fail |
+| P2 sandboxed cleanup | `Test-Sandboxed-Cleanup.ps1` | Cleaner works, and its guards refuse bad input | 82 pass / 0 fail |
+| P3 information modules | `Modules-Contract.ps1` | All eight modules load, collectors work, fields exist | 240 pass / 0 fail |
+| P4 read-only audit | `Tests-ReadOnly-Audit.ps1` | PM-Quick contains no destructive path, no duplicates | 32 pass / 0 fail |
+| | | **Total** | **435 pass / 0 fail** |
 
-### Real Sigma environment validation — pending
+Two techniques are worth calling out, because they are what make the results
+trustworthy rather than decorative:
 
-**Not yet performed.** The automated results above come from a development host,
-not the Sigma technician PC, and specifically do not cover:
+- **P1b redirects `TEMP` and `TMP`** to an empty sandbox for the child process
+  only. Every temporary file PM-Quick creates therefore lands somewhere
+  attributable, so concurrent noise from the real temp directory cannot produce
+  a false pass and a real leak cannot hide.
+- **P2 never runs the destructive engine against real user temp.**
+  `Invoke-PMCleanup` has no `-Root` parameter, so it is exercised in a child
+  process with a redirected temp, and the Recycle Bin round trip records the bin
+  count before and after and restores it exactly.
 
-- launching through `PM-Quick.bat` and the UAC elevation hand-off
-- the interactive console output and the Y/N confirmation gate
-- behaviour in a genuinely elevated session
-- **Windows 11** — the development host runs Windows 10
-- the Sigma PC's physical storage hardware and SMART data
+Each suite writes `result-<Suite>.json` into the harness. `Clean-HarnessArtifacts.ps1`
+removes generated sample exports and is dry-run unless given `-Apply`.
 
-The step-by-step procedure and a sign-off block are in
-[`docs/P4-VALIDATION.md`](docs/P4-VALIDATION.md), Section 5.
+### Still a manual step
+
+The UAC hand-off, the interactive in-place progress bar and the Y/N confirmation
+gate need a physical console. The automated suites cover the non-elevated branch
+and the redirected-output branch; the UAC-elevated and interactive paths are
+unverified by machine and are not claimed to be covered.
 
 ---
 
-## 11. Project status
-
-```text
-Core implementation complete.
-Automated safety/regression validation complete.
-Real-world Sigma validation PENDING.
-```
+## 13. Project status
 
 | Area | Status |
 |---|---|
-| Core implementation | Complete |
-| Automated safety and regression validation | Complete — 348 assertions, 0 failures |
-| Safety audit | Complete — 0 findings |
-| Documentation | Complete |
-| Real Sigma environment validation | **Pending** — requires physical execution |
-| `v1.0.0` release | **Blocked** until Sigma validation is signed off |
+| Read/write split | Complete |
+| Read-only inspection modules | Complete |
+| Collection progress (6 steps, console + redirected) | Complete |
+| Mandatory elevation in `PM-Quick.bat` | Complete — non-elevated branch verified, UAC branch manual |
+| Temp-Cleaner safety code | Complete — moved from the frozen baseline, 10 of 13 functions byte-identical |
+| Automated validation | Complete — 435 assertions, 0 failures |
+| Real environment validation | **Pending** — requires physical execution |
+| Release | **Blocked** until real-environment validation is signed off |
 
-This is not claimed to be production ready. The release gate is the Sigma
-validation sign-off, not the automated suite.
+The three moved functions that are **not** byte-identical were each changed on
+purpose, and P1a asserts the specific markers that prove the change is the
+intended one rather than an unrelated edit:
+
+| Function | Intentional change |
+|---|---|
+| `Get-TempTreeSafe` | Root guard now requires a drive-qualified root. `[System.IO.Path]::IsPathRooted` returns `True` for the drive-relative form `C:`, which previously walked the entire drive. |
+| `Get-DirectorySize` | Returns a real `0` for an existing-but-empty directory instead of `$null`. |
+| `Invoke-PMCleanup` | Warnings use `.ToArray()`; on PowerShell 5.1 `@($list)` yields a one-element array holding the list. |
+
+This is not claimed to be production ready. The release gate is the physical
+validation, not the automated suite.
 
 ---
 
@@ -399,25 +485,31 @@ validation sign-off, not the automated suite.
 
 ```text
 PM-Quick/
-|-- PM-Quick.bat              launcher, self-elevates to Administrator
-|-- PM-Quick.ps1              main script: collect, preview, confirm, report
+|-- PM-Quick.bat              launcher (read-only tool)
+|-- PM-Quick.ps1              main read-only script: collect, report, summarise
 |-- README.md                 this file
 |-- .gitignore
-|-- docs/
-|   `-- P4-VALIDATION.md      validation record and Sigma sign-off sheet
-`-- modules/
-    |-- System.ps1            PC name, serial, Windows, user
-    |-- Network.ps1           IPv4 detection, virtual adapter filtering
-    |-- Performance.ps1       CPU and memory snapshot
-    |-- Storage.ps1           drive detection, SSD/HDD, internal/external
-    |-- SSD.ps1               SSD health, wear, SMART fallback
-    `-- Cleanup.ps1           TEMP cleanup, Recycle Bin validation, reporting
+|-- output/                   local JSON exports (git-ignored)
+|-- modules/
+|   |-- System.ps1            identity, Windows build, uptime, device type
+|   |-- Hardware.ps1          CPU, RAM, GPU, motherboard, disk hardware
+|   |-- Network.ps1           adapters, addresses, gateway, DNS
+|   |-- Performance.ps1       CPU and memory snapshot
+|   |-- Storage.ps1           drives, free %, disk SMART status
+|   |-- SSD.ps1               SSD health, wear, SMART fallback
+|   |-- Health.ps1            battery, TPM, Secure Boot, WU, disks
+|   `-- Report.ps1            rendering, summary, recommendations, JSON
+`-- Temp-Cleaner/
+    |-- Temp-Cleaner.bat      launcher, self-elevates to Administrator
+    `-- Temp-Cleaner.ps1      the only script that deletes anything
 ```
 
 ## Safety and scope
 
-- Local-only tool. Nothing is sent anywhere.
+- Local-only tools. Nothing is sent anywhere.
+- PM-Quick never deletes, recycles, or touches the Recycle Bin.
 - No registry, service, network or Windows Update modification.
 - No telemetry, cloud, API or database functionality.
 - No external dependencies beyond built-in Windows and .NET Framework.
+- No product key, credential or software serial is collected.
 - Release version is tracked by Git, not by a version variable in the code.

@@ -1,120 +1,127 @@
 function Get-PMStorageInfo {
+    <#
+    .SYNOPSIS
+        Read-only drive inventory with free-space percentage, plus physical disk
+        and disk-controller health.
+    .DESCRIPTION
+        The main addition over the old version is a computed FreePct: a drive at
+        "18 GB free" says nothing without knowing how big it is, and FreePct is
+        the number that actually drives a "disk is filling up" recommendation.
+
+        The read-only health status is reported separately from SSD wear because
+        they are different things: a "Healthy" SMART status says the disk is
+        not failing, not that it is not nearly full. Reporting only SMART is
+        how a full disk slips through a health check.
+
+        All queries are WMI reads. No repair, no chkdsk, no SMART write, no
+        volume change.
+    #>
     [CmdletBinding()]
     param()
 
-    $drives = @()
+    $drives = New-Object System.Collections.ArrayList
+    $lowSpace = New-Object System.Collections.ArrayList
 
-    $externalBusTypes = @('USB', '1394', 'SD', 'MMC')
+    # FreePct at or below this is what gets flagged for a technician.
+    $lowSpaceThreshold = 10
 
-    # Method 1: Get-Volume + Get-Partition + Get-Disk + Get-PhysicalDisk chain
     try {
-        $volumes = Get-Volume -ErrorAction Stop |
-            Where-Object { $_.DriveLetter -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') }
+        $logicalDisks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop)
+        foreach ($d in $logicalDisks) {
+            $sizeGB = 0
+            $freeGB = 0
+            $freePct = $null
 
-        foreach ($vol in $volumes) {
-            $letter   = $vol.DriveLetter
-            $fs       = $vol.FileSystem
-            $totalRaw = $vol.Size
-            $freeRaw  = $vol.SizeRemaining
+            if ($d.Size -and $d.Size -gt 0) {
+                $sizeGB = [math]::Round($d.Size / 1GB, 1)
+                $freeGB = [math]::Round($d.FreeSpace / 1GB, 1)
+                $freePct = [math]::Round(($d.FreeSpace / $d.Size) * 100, 1)
+            }
 
-            if (-not $totalRaw -or $totalRaw -eq 0) { continue }
+            $label = '{0}:' -f $d.DeviceID
+            $status = 'Normal'
 
-            $totalGB = [math]::Round($totalRaw / 1GB, 2)
-            $freeGB  = [math]::Round($freeRaw / 1GB, 2)
-
-            # Try to map to physical disk
-            $mediaType  = 'Unknown'
-            $busType    = 'Unknown'
-            $location   = 'Unknown'
-
-            try {
-                $partition = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-
-                if ($partition) {
-                    $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction SilentlyContinue
-
-                    if ($disk) {
-                        $busType = "$($disk.BusType)"
-
-                        $physical = Get-PhysicalDisk -ErrorAction SilentlyContinue |
-                            Where-Object { "$($_.DeviceId)" -eq "$($disk.Number)" } |
-                            Select-Object -First 1
-
-                        if ($physical) {
-                            $mediaType = "$($physical.MediaType)"
-                        } else {
-                            # Fallback: SpindleSpeed from CIM
-                            try {
-                                $cimDisk = Get-CimInstance -Namespace Root\Microsoft\Windows\Storage `
-                                    -ClassName MSFT_PhysicalDisk -ErrorAction SilentlyContinue |
-                                    Where-Object { "$($_.DeviceId)" -eq "$($disk.Number)" } |
-                                    Select-Object -First 1
-
-                                if ($cimDisk -and $cimDisk.SpindleSpeed -eq 0) {
-                                    $mediaType = 'SSD'
-                                } elseif ($cimDisk -and $cimDisk.SpindleSpeed -gt 0 -and $cimDisk.SpindleSpeed -ne 4294967295) {
-                                    $mediaType = 'HDD'
-                                }
-                            } catch {}
-                        }
-
-                        if ($busType -in $externalBusTypes) {
-                            $location = 'External'
-                        } else {
-                            $location = 'Internal'
-                        }
-                    }
+            if ($freePct -ne $null) {
+                if ($freePct -le 2) {
+                    $status = 'Critical'
+                    [void]$lowSpace.Add("$label free space is critically low ($freePct%)")
+                } elseif ($freePct -le $lowSpaceThreshold) {
+                    $status = 'Low'
+                    [void]$lowSpace.Add("$label free space is low ($freePct%)")
                 }
-            } catch {}
-
-            # Classify media type
-            $typeLabel = switch ($mediaType) {
-                'SSD'         { 'SSD' }
-                'HDD'         { 'HDD' }
-                'SCM'         { 'SCM' }
-                'Unspecified' { 'Unknown' }
-                default       { $mediaType }
             }
 
-            $drives += [pscustomobject]@{
-                Drive        = "${letter}:"
-                FileSystem   = $fs
-                TotalGB      = $totalGB
-                FreeGB       = $freeGB
-                MediaType    = $typeLabel
-                BusType      = $busType
-                Location     = $location
-            }
+            [void]$drives.Add([pscustomobject]@{
+                Drive     = $d.DeviceID
+                Label     = if ($d.VolumeName) { $d.VolumeName } else { 'N/A' }
+                FileSystem = if ($d.FileSystem) { $d.FileSystem } else { 'N/A' }
+                TotalGB   = if ($sizeGB -gt 0) { $sizeGB } else { 'N/A' }
+                FreeGB    = if ($sizeGB -gt 0) { $freeGB } else { 'N/A' }
+                UsedGB    = if ($sizeGB -gt 0) { [math]::Round($sizeGB - $freeGB, 1) } else { 'N/A' }
+                FreePct   = if ($freePct -ne $null) { "$freePct%" } else { 'N/A' }
+                Status    = $status
+            })
         }
     } catch {}
 
-    # Fallback: Win32_LogicalDisk if Get-Volume failed
-    if ($drives.Count -eq 0) {
-        try {
-            $logicalDisks = Get-CimInstance Win32_LogicalDisk -ErrorAction Stop |
-                Where-Object { $_.DriveType -in @(2, 3) }  # Fixed=3, Removable=2
+    # --- physical disk hardware ---------------------------------------------
+    # Win32_DiskDrive.MediaType is deprecated and returns the literal string
+    # "Fixed hard disk media" for nearly every modern SATA/NVMe disk, so the
+    # Storage module is asked first and WMI is only the fallback. BusType and
+    # MediaType from Get-PhysicalDisk are accurate.
+    $disks = New-Object System.Collections.ArrayList
+    $physByModel = @{}
+    try {
+        foreach ($pd in @(Get-PhysicalDisk -ErrorAction Stop)) {
+            $key = ([string]$pd.FriendlyName).Trim().ToUpper()
+            if ($key) { $physByModel[$key] = $pd }
+        }
+    } catch {}
 
-            foreach ($ld in $logicalDisks) {
-                $letter = $ld.DeviceID
-                $totalRaw = $ld.Size
-                $freeRaw  = $ld.FreeSpace
+    try {
+        foreach ($d in @(Get-CimInstance Win32_DiskDrive -ErrorAction Stop)) {
+            $model = if ($d.Model) { ([string]$d.Model).Trim() } else { 'N/A' }
+            $serial = ([string]$d.SerialNumber).Trim()
+            if ($serial) { $serial = ($serial -replace '\s+', ' ').Trim() }
 
-                if (-not $totalRaw -or $totalRaw -eq 0) { continue }
+            $media = 'Unknown'
+            $bus = if ($d.InterfaceType) { $d.InterfaceType } else { 'Unknown' }
 
-                $drives += [pscustomobject]@{
-                    Drive        = $letter
-                    FileSystem   = $ld.FileSystem
-                    TotalGB      = [math]::Round($totalRaw / 1GB, 2)
-                    FreeGB       = [math]::Round($freeRaw / 1GB, 2)
-                    MediaType    = 'Unknown'
-                    BusType      = 'Unknown'
-                    Location     = if ($ld.DriveType -eq 2) { 'External' } else { 'Internal' }
-                }
+            $pd = $null
+            if ($physByModel.ContainsKey($model.ToUpper())) { $pd = $physByModel[$model.ToUpper()] }
+
+            if ($pd) {
+                if ($pd.MediaType) { $media = [string]$pd.MediaType }
+                if ($pd.BusType) { $bus = [string]$pd.BusType }
+            } else {
+                if ($d.MediaType -and $d.MediaType -notmatch 'Fixed hard disk media') { $media = $d.MediaType }
+                elseif ($model -match 'SSD|NVMe|Solid State') { $media = 'SSD' }
+                elseif ($model -match 'HDD|SATA|Mechanical') { $media = 'HDD' }
             }
-        } catch {}
-    }
 
-    # Sort: Internal first, then External, by drive letter
-    $drives | Sort-Object Location, Drive
+            # Status is null when the SMART data sits behind a bridge that will
+            # not answer it. Unknown is reported as Unknown, never as OK.
+            $status = 'Unknown'
+            if ($d.Status) {
+                $status = if ($d.Status -eq 'OK') { 'Healthy' } else { $d.Status }
+            }
+
+            [void]$disks.Add([pscustomobject]@{
+                Index     = $d.Index
+                Model     = $model
+                Serial    = if ($serial) { $serial } else { 'N/A' }
+                SizeGB    = if ($d.Size) { [math]::Round($d.Size / 1GB, 1) } else { 'N/A' }
+                Interface = $bus
+                MediaType = $media
+                Status    = $status
+            })
+        }
+    } catch {}
+
+    [pscustomobject]@{
+        Drives         = $drives.ToArray()
+        PhysicalDisks  = $disks.ToArray()
+        LowSpace       = $lowSpace.ToArray()
+        LowSpaceCount  = $lowSpace.Count
+    }
 }

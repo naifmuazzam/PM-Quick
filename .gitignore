@@ -1,8 +1,6 @@
-# Temporary/editor files
-*.tmp
-*.bak
-*.log
+# Local report output (optional JSON export)
+output/
+*.json
 
-# Test artifacts
-Dummy/
-test-output/
+# Temp-Cleaner backups
+Temp-Cleaner/*.bak

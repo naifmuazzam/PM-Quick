@@ -1,24 +1,45 @@
 <#
 .SYNOPSIS
-    PM Quick Tool - Lightweight Windows 11 Preventive Maintenance Assistant
+    PM-Quick - read-only PC health and inspection report for IT technicians.
+
 .DESCRIPTION
-    Gathers system info, performance snapshot, storage details, SSD health,
-    and performs safe TEMP/Recycle Bin cleanup.
+    Collects hardware, network, storage and health information and prints a
+    report. That is all it does.
+
+    This tool is STRICTLY READ-ONLY. It does not delete, recycle, empty or
+    modify anything:
+
+      - No file is deleted, moved or renamed
+      - The Recycle Bin is not read, enumerated or emptied
+      - No registry value is written
+      - No service, process or scheduled task is started or stopped
+      - No software is installed, updated or uninstalled
+      - Nothing is uploaded; there is no network call of any kind
+
+    All file cleanup lives in the separate Temp-Cleaner tool.
+
 .NOTES
-    For IT technician use during routine workstation preventive maintenance.
-    Does NOT modify system configuration, registry, services, or network settings.
+    Requires Windows PowerShell 5.1.
+    Runs without Administrator, but TPM, disk SMART and some firmware values
+    need elevation. Anything unreadable is reported as N/A or Unknown rather
+    than guessed.
+
+    Optional: -Json <path> writes the same data to a local JSON file for
+    attaching to a ticket. The file is written locally and nowhere else.
 #>
 
-#Requires -Version 5.1
-#Requires -RunAsAdministrator
+[CmdletBinding()]
+param(
+    # Write the collected data to a local JSON file. Local only, no upload.
+    [string]$Json
+)
 
 $ErrorActionPreference = 'SilentlyContinue'
-$scriptRoot = $PSScriptRoot
 
-# Fix console scrollbar cut-off after maximize/restore
+# Keep the console wide enough that a resize does not leave a scrollbar
+# artifact over the report.
 try {
-    $host.UI.RawUI.WindowTitle = 'PM Quick Tool'
-    # Ensure buffer is wide enough to prevent scrollbar glitch on resize
+    $host.UI.RawUI.WindowTitle = 'PM-Quick'
     $minWidth = 120
     $curBufW = $host.UI.RawUI.BufferSize.Width
     $curWinW = $host.UI.RawUI.WindowSize.Width
@@ -28,291 +49,459 @@ try {
     }
 } catch {}
 
-# Load modules
-. "$scriptRoot\modules\System.ps1"
-. "$scriptRoot\modules\Network.ps1"
-. "$scriptRoot\modules\Performance.ps1"
-. "$scriptRoot\modules\Storage.ps1"
-. "$scriptRoot\modules\SSD.ps1"
-. "$scriptRoot\modules\Cleanup.ps1"
+# ============================================================================
+# MODULES
+# ============================================================================
+# Every module below is read-only. The list is explicit rather than a wildcard
+# so an added file can never be picked up by accident.
+$script:ModuleRoot = Join-Path -Path $PSScriptRoot -ChildPath 'modules'
 
-function Write-SectionHeader {
-    param([string]$Title)
-    Write-Host ""
-    Write-Host "  $Title" -ForegroundColor Cyan
-    Write-Host "  $('=' * 40)" -ForegroundColor DarkGray
+$modules = @(
+    'System.ps1'
+    'Hardware.ps1'
+    'Network.ps1'
+    'Performance.ps1'
+    'Storage.ps1'
+    'Health.ps1'
+    'Report.ps1'
+    'SSD.ps1'   # optional: not every machine exposes wear data
+)
+
+foreach ($m in $modules) {
+    $path = Join-Path -Path $script:ModuleRoot -ChildPath $m
+    if (Test-Path -LiteralPath $path) {
+        try { . $path } catch { Write-Warning "Failed to load $m : $($_.Exception.Message)" }
+    } elseif ($m -eq 'SSD.ps1') {
+        # Optional module: its absence is normal and handled by the health check.
+    } else {
+        Write-Warning "Missing module: $m"
+    }
 }
 
-function Write-Field {
+# ============================================================================
+# PROGRESS
+# ============================================================================
+# Collection is not instant: the performance sampler alone blocks for seconds
+# and SMART/SSD queries can stall on a spinning disk or a bridge that will not
+# answer. Without feedback that reads as a hang, so each step updates a bar.
+#
+# In an interactive console the bar is rewritten in place on a single line.
+# When output is redirected, or the host is not a console host, escape codes
+# would corrupt a log file, so the same bar is printed as one plain line per
+# step instead. Both paths show identical text.
+$script:ProgressInPlace = $false
+try {
+    if ($Host.Name -match 'ConsoleHost' -and -not [Console]::IsOutputRedirected) {
+        $script:ProgressInPlace = $true
+    }
+} catch {
+    $script:ProgressInPlace = $false
+}
+
+function Write-PMProgress {
     param(
-        [string]$Label,
-        [string]$Value,
-        [int]$LabelWidth = 18
-    )
-    $padded = $Label.PadRight($LabelWidth)
-    Write-Host "  $padded" -NoNewline
-    Write-Host $Value
-}
-
-# Decides what a single answer to the cleanup confirmation means.
-# Deliberately total and side-effect free: only a literal Y/y can ever
-# authorise the destructive action, so stray or buffered keystrokes - including
-# a bare Enter - can never be read as consent.
-function Get-PMConfirmDecision {
-    param(
-        [AllowNull()]
-        [AllowEmptyString()]
-        [string]$Answer
+        [Parameter(Mandatory)][int]$Index,
+        [Parameter(Mandatory)][int]$Total,
+        [Parameter(Mandatory)][string]$Label,
+        [string]$Note = ''
     )
 
-    # Enter, or anything with no non-whitespace content, is not consent.
-    if ($null -eq $Answer) { return 'RETRY' }
-    $normalized = $Answer.Trim()
-    if ($normalized.Length -eq 0) { return 'RETRY' }
+    $barWidth = 24
+    $ratio = [double]$Index / [double]$Total
+    $filled = [int][math]::Floor($ratio * $barWidth)
+    # Show at least one block for any completed step, otherwise step 1 of 6
+    # renders as an empty bar and looks like nothing happened.
+    if ($filled -lt 1 -and $Index -gt 0) { $filled = 1 }
+    $bar = ('#' * $filled) + ('.' * ($barWidth - $filled))
+    $pct = [int][math]::Round($ratio * 100)
+    $text = '  Step {0}/{1}  [{2}] {3,3}%  {4}' -f $Index, $Total, $bar, $pct, $Label
+    if ($Note) { $text = "$text  $Note" }
 
-    if ($normalized -ceq 'Y' -or $normalized -ceq 'y') { return 'PROCEED' }
-    if ($normalized -ceq 'N' -or $normalized -ceq 'n') { return 'ABORT' }
-
-    # Anything else is invalid input: re-prompt, never assume consent.
-    return 'RETRY'
+    if ($script:ProgressInPlace) {
+        # Home, clear to end of line, then rewrite, so each step overwrites the
+        # last instead of scrolling a new line.
+        Write-Host ("$([char]27)[1G$([char]27)[0K$text") -NoNewline
+    } else {
+        Write-Host $text
+    }
 }
 
-# ============================================
-# HEADER
-# ============================================
-Clear-Host
+# ============================================================================
+# COLLECT
+# ============================================================================
+# Every collector is wrapped so that one unavailable WMI class cannot abort
+# the whole report. A missing value is shown as N/A, never invented.
+#
+# Steps are data, not a hand-written sequence, so the bar can never drift out of
+# sync with what actually runs: the label, the call and the progress counter all
+# come from the same entry.
+
 Write-Host ""
-Write-Host "  ========================================" -ForegroundColor Yellow
-Write-Host "            PM QUICK TOOL" -ForegroundColor Yellow
-Write-Host "  ========================================" -ForegroundColor Yellow
+Write-Host "  ========================================" -ForegroundColor Cyan
+Write-Host "            PM-QUICK  v2.0" -ForegroundColor Cyan
+Write-Host "         READ-ONLY INSPECTION" -ForegroundColor DarkGray
+Write-Host "  ========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Collecting system information..." -ForegroundColor DarkGray
 
-# ============================================
-# 1. SYSTEM INFORMATION
-# ============================================
-$sysInfo = $null
-try { $sysInfo = Get-PMSystemInfo } catch {}
-
-Write-SectionHeader 'SYSTEM'
-if ($sysInfo) {
-    Write-Field 'PC Name'      $sysInfo.PCName
-    Write-Field 'Serial'       $sysInfo.Serial
-    Write-Field 'Windows'      $sysInfo.Windows
-    Write-Field 'User'         $sysInfo.User
-} else {
-    Write-Field 'System' 'N/A - Collection failed'
+# Warnings are buffered rather than emitted mid-bar: Write-Warning between two
+# in-place updates would land on the bar line and corrupt it.
+$script:CollectWarnings = New-Object System.Collections.ArrayList
+$script:AddCollectWarning = {
+    param([string]$Message)
+    [void]$script:CollectWarnings.Add($Message)
 }
 
-# ============================================
-# 2. NETWORK INFORMATION
-# ============================================
-$netInfo = $null
-try { $netInfo = Get-PMNetworkInfo } catch {}
-
-Write-SectionHeader 'NETWORK'
-
-if ($netInfo -and $netInfo.Count -gt 0) {
-    $grouped = $netInfo.Adapters | Group-Object Adapter
-
-    foreach ($group in $grouped) {
-        $adapterName = $group.Name
-        $ips = ($group.Group | ForEach-Object { $_.IPv4 }) -join ', '
-        Write-Field $adapterName $ips
+$collectSteps = @(
+    [pscustomobject]@{
+        Label = 'System identity'
+        Run   = { Get-PMSystemInfo }
     }
-
-    if ($netInfo.Count -gt 1) {
-        Write-Host ""
-        Write-Host "  Multiple IPv4 addresses detected." -ForegroundColor Yellow
-        Write-Host "  Verify the IP used in MyERP manually." -ForegroundColor Yellow
+    [pscustomobject]@{
+        Label = 'Device type'
+        Run   = { Get-PMDeviceType }
     }
-} else {
-    Write-Field 'IPv4' 'N/A'
-}
-
-# ============================================
-# 3. PERFORMANCE SNAPSHOT
-# ============================================
-Write-Host ""
-Write-Host "  Sampling performance (3 seconds)..." -ForegroundColor DarkGray
-
-$perfSnap = $null
-try { $perfSnap = Get-PMPerformanceSnapshot -SampleSeconds 3 } catch {}
-
-Write-SectionHeader 'PERFORMANCE'
-if ($perfSnap) {
-    $cpuVal = if ($perfSnap.CPUUsage -eq 'N/A') { 'N/A' } else { "$($perfSnap.CPUUsage)%" }
-    $memVal = if ($perfSnap.MemoryUsage -eq 'N/A') { 'N/A' } else { "$($perfSnap.MemoryUsage)%" }
-    Write-Field 'CPU Usage'    $cpuVal
-    Write-Field 'Memory Usage' $memVal
-} else {
-    Write-Field 'CPU Usage'    'N/A'
-    Write-Field 'Memory Usage' 'N/A'
-}
-
-# ============================================
-# 4. STORAGE
-# ============================================
-$storageInfo = $null
-try { $storageInfo = Get-PMStorageInfo } catch {}
-
-Write-SectionHeader 'STORAGE'
-
-if ($storageInfo -and $storageInfo.Count -gt 0) {
-    $internalDrives = $storageInfo | Where-Object { $_.Location -eq 'Internal' }
-    $externalDrives = $storageInfo | Where-Object { $_.Location -eq 'External' }
-    $unknownDrives  = $storageInfo | Where-Object { $_.Location -notin @('Internal', 'External') }
-
-    if ($internalDrives) {
-        Write-Host "  [INTERNAL]" -ForegroundColor Green
-        foreach ($d in $internalDrives) {
-            $typeTag = if ($d.MediaType -and $d.MediaType -ne 'Unknown') { $d.MediaType } else { $d.BusType }
-            Write-Host "  $($d.Drive) $typeTag" -ForegroundColor White
-            Write-Field 'Total' "$($d.TotalGB) GB"
-            Write-Field 'Free'  "$($d.FreeGB) GB"
-            Write-Host ""
+    [pscustomobject]@{
+        Label = 'Hardware inventory'
+        Run   = { Get-PMHardwareInfo }
+    }
+    [pscustomobject]@{
+        Label = 'Network adapters'
+        Run   = { Get-PMNetworkInfo }
+    }
+    [pscustomobject]@{
+        Label = 'Performance sample'
+        Run   = { Get-PMPerformanceSnapshot }
+    }
+    [pscustomobject]@{
+        # Storage and health share one step because health re-queries the disks
+        # and SSDs that storage just walked, so they are the same slow phase.
+        Label = 'Storage + health'
+        Run   = {
+            $sto = $null
+            $hea = $null
+            try { $sto = Get-PMStorageInfo } catch { & $script:AddCollectWarning 'Storage info unavailable' }
+            try { $hea = Get-PMHealthCheck } catch { & $script:AddCollectWarning 'Health checks unavailable' }
+            [pscustomobject]@{ Storage = $sto; Health = $hea }
         }
     }
+)
 
-    if ($externalDrives) {
-        Write-Host "  [EXTERNAL]" -ForegroundColor Magenta
-        foreach ($d in $externalDrives) {
-            $typeTag = if ($d.MediaType -and $d.MediaType -ne 'Unknown') { $d.MediaType } else { $d.BusType }
-            Write-Host "  $($d.Drive) $typeTag" -ForegroundColor White
-            Write-Field 'Total' "$($d.TotalGB) GB"
-            Write-Field 'Free'  "$($d.FreeGB) GB"
-            Write-Host ""
-        }
-    }
+$collected = New-Object System.Collections.ArrayList
+# Two stopwatches on purpose: $sw is restarted per step for the per-step
+# timing, $swTotal runs across the whole loop. Reusing one would report only
+# the final step's duration as the total.
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$swTotal = [System.Diagnostics.Stopwatch]::StartNew()
 
-    if ($unknownDrives) {
-        Write-Host "  [UNKNOWN]" -ForegroundColor Yellow
-        foreach ($d in $unknownDrives) {
-            $typeTag = if ($d.MediaType -and $d.MediaType -ne 'Unknown') { $d.MediaType } else { $d.BusType }
-            Write-Host "  $($d.Drive) $typeTag" -ForegroundColor White
-            Write-Field 'Total' "$($d.TotalGB) GB"
-            Write-Field 'Free'  "$($d.FreeGB) GB"
-            Write-Host ""
-        }
+for ($i = 0; $i -lt $collectSteps.Count; $i++) {
+    $step = $collectSteps[$i]
+    $result = $null
+    $sw.Restart()
+    try {
+        $result = & $step.Run
+    } catch {
+        & $script:AddCollectWarning "$($step.Label) unavailable"
+        $result = $null
     }
-} else {
-    Write-Field 'Storage' 'N/A - No drives detected'
+    $sw.Stop()
+    [void]$collected.Add($result)
+
+    $note = ''
+    if ($result) { $note = ('{0:N1}s' -f $sw.Elapsed.TotalSeconds) }
+    Write-PMProgress -Index ($i + 1) -Total $collectSteps.Count -Label $step.Label -Note $note
+}
+$swTotal.Stop()
+
+# Close the bar line before any further output.
+if ($script:ProgressInPlace) { Write-Host '' }
+
+Write-Host ("  Collection finished in {0:N1}s." -f $swTotal.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+foreach ($w in $script:CollectWarnings) {
+    Write-Warning $w
 }
 
-# ============================================
-# 5. SSD HEALTH
-# ============================================
-$ssdHealth = $null
-try { $ssdHealth = Get-PMSSDHealth } catch {}
-
-Write-SectionHeader 'SSD HEALTH'
-
-if ($ssdHealth -and $ssdHealth.Count -gt 0) {
-    $mappedCount = 0
-    foreach ($ssd in $ssdHealth) {
-        if ($ssd.DriveLetters) {
-            Write-Host "  $($ssd.DriveLetters) SSD" -ForegroundColor White
-            Write-Field 'Health'         $ssd.Health
-            Write-Field 'Estimated Life' $ssd.EstimatedLife
-            Write-Host ""
-            $mappedCount++
-        }
-    }
-
-    # If no drive letters could be mapped, show generic info
-    if ($mappedCount -eq 0) {
-        Write-Host "  Physical SSDs detected: $($ssdHealth.Count)" -ForegroundColor White
-        Write-Host "  Health information available," -ForegroundColor DarkGray
-        Write-Host "  but drive mapping could not be determined reliably." -ForegroundColor DarkGray
-        Write-Host ""
-    }
-} else {
-    Write-Host "  No SSDs detected or health data unavailable." -ForegroundColor DarkGray
+$system      = $collected[0]
+$device      = $collected[1]
+$hardware    = $collected[2]
+$network     = $collected[3]
+$performance = $collected[4]
+$storage     = $null
+$health      = $null
+if ($collected[5]) {
+    $storage = $collected[5].Storage
+    $health  = $collected[5].Health
 }
 
-# ============================================
-# 6. CLEANUP
-# ============================================
-Write-SectionHeader 'CLEANUP PREVIEW'
-
-$cleanupEst = $null
-try { $cleanupEst = Get-TempCleanupEstimate } catch {}
-
-if ($cleanupEst) {
-    foreach ($item in $cleanupEst.Items) {
-        Write-Field $item.Location "$($item.SizeMB) MB"
-    }
-
-    if ($cleanupEst.SkippedCount -gt 0) {
-        Write-Host ""
-        Write-Host "  Recycle Bin: $($cleanupEst.SkippedCount) non-TEMP items will be left untouched." -ForegroundColor DarkGray
-    }
-} else {
-    Write-Field 'Cleanup' 'N/A - Could not estimate'
-}
-
-# Ask for confirmation. Only an explicit Y or y may cross this gate; Enter,
-# whitespace and any other input re-prompt instead of defaulting to cleanup.
-$runCleanup = $false
-while ($true) {
-    Write-Host "  Proceed with cleanup? [Y/N]: " -NoNewline -ForegroundColor Yellow
-    $decision = Get-PMConfirmDecision -Answer (Read-Host)
-
-    if ($decision -eq 'PROCEED') { $runCleanup = $true; break }
-    if ($decision -eq 'ABORT')  { $runCleanup = $false; break }
-
-    Write-Host "  Please enter Y or N." -ForegroundColor Yellow
-}
-
-if ($runCleanup) {
-    Write-Host ""
-    Write-Host "  Running cleanup..." -ForegroundColor DarkGray
-    Write-Field 'User TEMP'    'Cleaning...'
-    Write-Field 'Windows TEMP' 'Cleaning...'
-    Write-Field 'Recycle Bin'  'Cleaning...'
-
-    $cleanupResult = $null
-    $cleanupError = $null
-    try { $cleanupResult = Invoke-PMCleanup } catch { $cleanupError = $_ }
-
-    if ($cleanupResult) {
-        Write-Host ""
-        Write-Field 'User TEMP'     $cleanupResult.UserTempCleaned
-        Write-Field 'Windows TEMP'  $cleanupResult.WinTempCleaned
-        Write-Field 'Recycle Bin'   $cleanupResult.RecycleCleaned
-
-        # Legacy counter: covers locked files, failed recycles and failed purges
-        # alike, so it is not reported as "locked" specifically. The per-stage
-        # breakdown below is the authoritative detail.
-        if ($cleanupResult.FilesSkipped -gt 0) {
-            Write-Field 'Skipped / Failed' "$($cleanupResult.FilesSkipped) items"
-        }
-        if ($cleanupResult.TempFilesSkipped -gt 0) {
-            Write-Field 'Skipped (non-TEMP)' "$($cleanupResult.TempFilesSkipped) items"
-        }
-
-        # Detailed per-location report. Purely additive: the fields above keep
-        # their original names, order and meaning.
-        try {
-            Write-Host ""
-            Format-PMCleanupReport -Result $cleanupResult | ForEach-Object { Write-Host $_ }
-        } catch {}
+# Merge device identity into the system view for display.
+if ($system) {
+    if ($device) {
+        Add-Member -InputObject $system -NotePropertyName 'DeviceType' -NotePropertyValue $device.DeviceType -Force
+        Add-Member -InputObject $system -NotePropertyName 'DeviceEvidence' -NotePropertyValue $device.Evidence -Force
     } else {
-        Write-Host "  Cleanup failed or was interrupted." -ForegroundColor Red
-        if ($cleanupError) {
-            Write-Host "  Reason: $($cleanupError.Exception.Message)" -ForegroundColor Red
-        }
+        Add-Member -InputObject $system -NotePropertyName 'DeviceType' -NotePropertyValue 'Unknown' -Force
     }
-} else {
-    Write-Host ""
-    Write-Host "  Cleanup skipped by user." -ForegroundColor DarkGray
 }
 
-# ============================================
+# Assemble the full result set for the summary and the optional JSON export.
+$inspection = [pscustomobject]@{
+    GeneratedAt = (Get-Date).ToString('o')
+    ComputerName = [System.Environment]::MachineName
+    Tool        = 'PM-Quick 2.0 (read-only)'
+    System      = $system
+    Device      = [pscustomobject]@{
+        DeviceType     = if ($device) { $device.DeviceType } else { 'Unknown' }
+        Manufacturer   = if ($system) { $system.Manufacturer } else { 'N/A' }
+        Model          = if ($system) { $system.Model } else { 'N/A' }
+        Evidence       = if ($device) { $device.Evidence } else { 'N/A' }
+    }
+    Hardware    = $hardware
+    Performance = $performance
+    Network     = $network
+    Storage     = $storage
+    Health      = $health
+}
+
+# ============================================================================
+# DISPLAY
+# ============================================================================
+
+if ($system) {
+    Format-PMSectionHeader 'SYSTEM'
+    Write-PMField 'PC Name'         $system.PCName
+    Write-PMField 'Manufacturer'    $system.Manufacturer
+    Write-PMField 'Model'           $system.Model
+    Write-PMField 'Serial'          $system.Serial
+    Write-PMField 'Type'            $system.DeviceType
+    Write-PMField 'Windows'         $system.Windows
+    Write-PMField 'Build'           $system.Build
+    Write-PMField 'Architecture'    $system.Architecture
+    Write-PMField 'User'            $system.User
+    Write-PMField 'Uptime'          $system.Uptime
+    if ($device -and $device.Evidence) {
+        Write-Host "    type detected from: $($device.Evidence)" -ForegroundColor DarkGray
+    }
+}
+
+if ($hardware) {
+    Format-PMSectionHeader 'HARDWARE'
+    # These are built before printing. An if-expression cannot be passed inline
+    # as a command argument: PowerShell binds 'if' as the argument and leaves
+    # the else-branch as a stray statement, which renders as "CPU Clockif".
+    $cpuClockText = 'N/A'
+    if ($hardware.CPUBaseMHz -ne 'N/A') {
+        # Labelled "current", not "base": this is Win32_Processor
+        # .CurrentClockSpeed, which is the clock at the sampling instant and
+        # has nothing to do with the architectural base frequency.
+        $cpuClockText = "$($hardware.CPUBaseMHz) MHz current / $($hardware.CPUMaxMHz) MHz max"
+    }
+    $slotTotalText = 'N/A'
+    if ($hardware.RAMSlotsTotal -ne 'N/A') { $slotTotalText = $hardware.RAMSlotsTotal }
+    $ramSpeedText = 'N/A'
+    if ($hardware.RAMSpeedMHz -ne 'N/A') { $ramSpeedText = "$($hardware.RAMSpeedMHz) MHz" }
+
+    Write-PMField 'CPU'             $hardware.CPU
+    Write-PMField 'CPU Cores'       "$($hardware.CPUCores) physical / $($hardware.CPUThreads) logical"
+    Write-PMField 'CPU Clock'       $cpuClockText
+    Write-PMField 'RAM'             $hardware.RAMTotal
+    Write-PMField 'RAM Slots'       "$($hardware.RAMSlotsUsed) used / $slotTotalText total"
+    Write-PMField 'RAM Speed'       $ramSpeedText
+    Write-PMField 'RAM Type'        $hardware.RAMFormFactor
+
+    if (@($hardware.RAMModules).Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Memory modules:" -ForegroundColor DarkGray
+        foreach ($m in $hardware.RAMModules) {
+            # The PadLeft calls have to live INSIDE the subexpression, otherwise
+            # PowerShell expands the value and leaves ".PadLeft(5)" as literal text.
+            $cap = ([string]$m.CapacityGB).PadLeft(5)
+            # BankLabel is only worth a second column when it adds information.
+            # On boards that report a duplicate DeviceLocator, Hardware.ps1
+            # promotes BankLabel into Locator, and printing both would repeat it.
+            $slot = $m.Locator
+            if ($m.Bank -and $m.Bank -ne 'N/A' -and $m.Bank -ne $m.Locator) {
+                $slot = "$($m.Locator) / $($m.Bank)"
+            }
+            Write-Host "    $($slot.PadRight(26)) $cap GB  $($m.SpeedMHz) MHz  $($m.FormFactor)  $($m.Manufacturer)" -ForegroundColor DarkGray
+        }
+    }
+
+    $gpus = @($hardware.GPU)
+    Write-Host ""
+    if ($gpus.Count -gt 0) {
+        Write-Host "  Graphics:" -ForegroundColor DarkGray
+        foreach ($g in $gpus) {
+            Write-Host "    $($g.Name)" -ForegroundColor DarkGray
+            Write-Host "      VRAM: $($g.VRAM)   Driver: $($g.DriverVersion) ($($g.DriverDate))" -ForegroundColor DarkGray
+        }
+    } else {
+        Write-PMField 'Graphics' 'No GPU reported by WMI'
+    }
+
+    Write-Host ""
+    Write-PMField 'Motherboard'     "$($hardware.Motherboard) $($hardware.MotherboardModel)"
+
+    $ph = @($hardware.StorageHardware)
+    if ($ph.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Physical disks:" -ForegroundColor DarkGray
+        foreach ($d in $ph) {
+            # The field is Interface, not InterfaceType. Reading InterfaceType
+            # here returned nothing at all, which is why "bus:" printed blank.
+            $busText = if ($d.Interface) { $d.Interface } else { 'N/A' }
+            Write-Host "    [$($d.Index)] $($d.Model)" -ForegroundColor DarkGray
+            Write-Host "      $($d.SizeGB) GB  bus: $busText  media: $($d.MediaType)  serial: $($d.Serial)" -ForegroundColor DarkGray
+        }
+    }
+}
+
+if ($performance) {
+    Format-PMSectionHeader 'PERFORMANCE'
+    # Get-PMPerformanceSnapshot reports CPUUsage, MemoryUsage and TotalRAMGB.
+    # Rendering its real contract matters: an if-expression cannot be passed as
+    # an argument inline, so each line is built first and printed after.
+    if ($null -ne $performance.CPUUsage -and $performance.CPUUsage -ne 'N/A') {
+        $c = $performance.CPUUsage
+        $cpuColor = if ($c -ge 90) { 'Red' } elseif ($c -ge 70) { 'Yellow' } else { 'Green' }
+        Write-Host "  " -NoNewline
+        Write-Host 'CPU Load'.PadRight(18) -NoNewline
+        Write-Host "$c%" -ForegroundColor $cpuColor
+    } else {
+        Write-PMField 'CPU Load' 'N/A'
+    }
+
+    if ($null -ne $performance.MemoryUsage -and $performance.MemoryUsage -ne 'N/A') {
+        $m = $performance.MemoryUsage
+        $memColor = if ($m -ge 90) { 'Red' } elseif ($m -ge 75) { 'Yellow' } else { 'Green' }
+        $totalText = ''
+        if ($performance.TotalRAMGB -and $performance.TotalRAMGB -ne 'N/A') {
+            $totalText = " of $($performance.TotalRAMGB) GB"
+        }
+        Write-Host "  " -NoNewline
+        Write-Host 'Memory'.PadRight(18) -NoNewline
+        Write-Host "$m% used$totalText" -ForegroundColor $memColor
+    } else {
+        Write-PMField 'Memory' 'N/A'
+    }
+}
+
+if ($network) {
+    Format-PMSectionHeader 'NETWORK'
+    $adapters = @($network.Adapters)
+    if ($adapters.Count -gt 0) {
+        foreach ($a in $adapters) {
+            $state = if ($a.Status -eq 2) { 'Connected' } else { 'Disconnected' }
+            $color = if ($a.Status -eq 2) { 'Green' } else { 'DarkGray' }
+            Write-Host "  " -NoNewline
+            Write-Host $a.Name -NoNewline
+            Write-Host "  [$state]" -ForegroundColor $color
+            Write-Host "    $($a.Description)" -ForegroundColor DarkGray
+            Write-Host "    Type: $($a.Type)   MAC: $($a.MAC)   DHCP: $($a.DHCP)" -ForegroundColor DarkGray
+            if ($a.SpeedMbps -ne 'N/A') {
+                Write-Host "    Speed: $($a.SpeedMbps) Mbps" -ForegroundColor DarkGray
+            }
+            foreach ($addr in @($a.Addresses)) {
+                if ($addr.IP -ne '127.0.0.1' -and $addr.IP -ne '::1') {
+                    Write-Host "    $($addr.Version): $($addr.IP)" -ForegroundColor DarkGray
+                }
+            }
+        }
+    } else {
+        Write-PMField 'Adapters' 'None reported'
+    }
+
+    if (@($network.Gateways).Count -gt 0) {
+        # Lead with the routable gateway the module picked, and only list
+        # extras that a technician could act on. An IPv6 fe80:: link-local
+        # gateway is not actionable, so it is not shown alongside IPv4.
+        $gwShown = @()
+        if ($network.PrimaryGateway -and $network.PrimaryGateway -ne 'N/A') { $gwShown += $network.PrimaryGateway }
+        foreach ($g in @($network.Gateways)) {
+            if ($gwShown -contains $g) { continue }
+            if ($g -like 'fe80:*') { continue }
+            $gwShown += $g
+        }
+        if ($gwShown.Count -gt 0) {
+            Write-Host ""
+            Write-PMField 'Default Gateway' ($gwShown -join ', ')
+        }
+    }
+    if (@($network.DNSServers).Count -gt 0) {
+        Write-PMField 'DNS Servers'    (@($network.DNSServers) -join ', ')
+    }
+}
+
+if ($storage) {
+    Format-PMSectionHeader 'STORAGE'
+    foreach ($d in @($storage.Drives)) {
+        $line = "{0}  {1,-6}  Total {2} GB  Used {3} GB  Free {4} GB ({5})" -f `
+            $d.Drive, $d.FileSystem, $d.TotalGB, $d.UsedGB, $d.FreeGB, $d.FreePct
+        $color = Get-PMHealthColor -Status $d.Status
+        Write-Host "  " -NoNewline
+        Write-Host $line -ForegroundColor $color
+    }
+
+    $pd = @($storage.PhysicalDisks)
+    if ($pd.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Disk health:" -ForegroundColor DarkGray
+        foreach ($d in $pd) {
+            Write-Host "    " -NoNewline
+            Write-Host $d.Model.PadRight(34) -NoNewline
+            Write-Host $d.Status -ForegroundColor (Get-PMHealthColor -Status $d.Status)
+        }
+    }
+}
+
+if ($health) {
+    Format-PMSectionHeader 'HEALTH CHECKS'
+    Write-PMHealthChecks -Checks $health.Checks
+
+    Write-Host ""
+    $overallColor = if ($health.WarningCount -gt 0) { 'Yellow' } elseif ($health.UnknownCount -gt 0) { 'DarkGray' } else { 'Green' }
+    Write-Host "  Overall: " -NoNewline
+    Write-Host $health.OverallStatus -ForegroundColor $overallColor
+}
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+Format-PMSectionHeader 'SUMMARY'
+$summary = $null
+try { $summary = Get-PMSummaryText -Inspection $inspection } catch {}
+if ($summary) {
+    foreach ($line in ($summary -split [Environment]::NewLine)) {
+        Write-Host "  $line"
+    }
+}
+
+# ============================================================================
+# OPTIONAL LOCAL JSON EXPORT
+# ============================================================================
+if ($Json) {
+    try {
+        # Default into the project's own output directory, never anywhere else.
+        if (-not [System.IO.Path]::IsPathRooted($Json)) {
+            $Json = Join-Path -Path $PSScriptRoot -ChildPath (Join-Path -Path 'output' -ChildPath $Json)
+        }
+
+        $saved = Export-PMInspectionJson -Inspection $inspection -Path $Json
+        Write-Host ""
+        Write-Host "  Report saved locally: $saved" -ForegroundColor Green
+        Write-Host "  (local file only - nothing was uploaded)" -ForegroundColor DarkGray
+    } catch {
+        Write-Host ""
+        Write-Host "  Could not write JSON report: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# ============================================================================
 # FOOTER
-# ============================================
+# ============================================================================
 Write-Host ""
-Write-Host "  ========================================" -ForegroundColor Yellow
-Write-Host "            PM COMPLETE" -ForegroundColor Yellow
-Write-Host "  ========================================" -ForegroundColor Yellow
+Write-Host "  ========================================" -ForegroundColor Cyan
+Write-Host "  Read-only report complete. Nothing was" -ForegroundColor DarkGray
+Write-Host "  changed, deleted or uploaded." -ForegroundColor DarkGray
+Write-Host "  For TEMP/Recycle Bin cleanup run Temp-Cleaner.bat" -ForegroundColor DarkGray
+Write-Host "  ========================================" -ForegroundColor Cyan
 Write-Host ""

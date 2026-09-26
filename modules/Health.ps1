@@ -67,29 +67,51 @@ function Get-PMHealthCheck {
         $tpm = Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction Stop |
             Select-Object -First 1
         if ($tpm) {
-            # Both flags are read explicitly, because a missing property is $null
-            # and -not $null is true, which would report a healthy TPM as broken.
-            $enabled   = ($null -ne $tpm.IsEnabled_)
-            $activated = ($null -ne $tpm.IsActivated)
-            $firmware  = if ($tpm.ManufacturerVersionFull20) { $tpm.ManufacturerVersionFull20 } else { 'unknown firmware' }
-            $specVer   = if ($null -ne $tpm.SpecVersion) { $tpm.SpecVersion } else { 'unknown spec version' }
+            $firmware = if ($tpm.ManufacturerVersionFull20) { $tpm.ManufacturerVersionFull20 } else { 'unknown firmware' }
+            $specVer  = if ($null -ne $tpm.SpecVersion) { $tpm.SpecVersion } else { 'unknown spec version' }
 
-            # The detail has to be derived from the flags. A hardcoded
-            # "is enabled and activated" printed next to a Warning status is a
-            # contradiction the reader cannot resolve, and it is worse than
-            # saying nothing.
-            if ($enabled -and $activated) {
-                $status = 'OK'
-                $detail = "TPM $firmware is enabled and activated."
-            } else {
-                $status = 'Warning'
-                $faults = @()
-                if (-not $enabled)   { $faults += 'not enabled in firmware' }
-                if (-not $activated) { $faults += 'present but not activated' }
-                if ($faults.Count -eq 0) { $faults += 'in an unrecognised state' }
-                $detail = "TPM $firmware is " + ($faults -join ' and ') + '.'
+            # Win32_Tpm's boolean properties are spelled with a trailing
+            # underscore, but the class has carried both spellings across
+            # Windows builds, and a name that does not exist reads as $null
+            # rather than failing. So both are tried and the first hit wins.
+            # Anything still unreadable is reported as Unknown: claiming the
+            # firmware has the TPM off because we could not read a property is
+            # a false accusation, and it sends the user to change a BIOS setting
+            # that was already correct.
+            $enabledRaw = $null
+            foreach ($name in 'IsEnabled_', 'IsEnabled') {
+                $prop = $tpm.PSObject.Properties[$name]
+                if ($null -ne $prop) { $enabledRaw = $prop.Value; break }
             }
-            Add-Check 'TPM' $status $specVer $detail
+            $activatedRaw = $null
+            foreach ($name in 'IsActivated_', 'IsActivated') {
+                $prop = $tpm.PSObject.Properties[$name]
+                if ($null -ne $prop) { $activatedRaw = $prop.Value; break }
+            }
+
+            if ($null -eq $enabledRaw -and $null -eq $activatedRaw) {
+                $seen = @($tpm.PSObject.Properties.Name | Where-Object { $_ -like 'Is*' }) -join ', '
+                Add-Check 'TPM' 'Unknown' $specVer `
+                    "TPM $firmware is present, but Windows did not report its enabled or activated state. Flags returned by this build: $seen"
+            } else {
+                $enabled   = [bool]$enabledRaw
+                $activated = [bool]$activatedRaw
+                # The detail is derived from the flags, because a fixed
+                # "is enabled and activated" printed next to a Warning status is
+                # a contradiction the reader cannot resolve.
+                if ($enabled -and $activated) {
+                    $status = 'OK'
+                    $detail = "TPM $firmware is enabled and activated."
+                } else {
+                    $status = 'Warning'
+                    $faults = @()
+                    if (-not $enabled)   { $faults += 'not enabled in firmware' }
+                    if (-not $activated) { $faults += 'present but not activated' }
+                    if ($faults.Count -eq 0) { $faults += 'in an unrecognised state' }
+                    $detail = "TPM $firmware is " + ($faults -join ' and ') + '.'
+                }
+                Add-Check 'TPM' $status $specVer $detail
+            }
         } else {
             Add-Check 'TPM' 'Unknown' 'N/A' 'No TPM is reported by Windows.'
         }

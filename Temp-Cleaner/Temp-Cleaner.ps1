@@ -431,28 +431,42 @@ function Format-PMCleanupReport {
     # No failure reason is categorised or invented here: the per-file detail
     # lines below carry the real exception text.
     $warnList = @(Get-PMReportValue -InputObject $Result -Name 'Warnings' -Default @())
-    if ($warnList.Count -gt 0) {
-        $rows.Add(@('SECTION', 'WARNINGS'))
 
-        $stageOrder = @(
-            @{ Label = 'User TEMP';    Counter = 'UserTempFilesSkipped' },
-            @{ Label = 'Windows TEMP'; Counter = 'WinTempFilesSkipped' },
-            @{ Label = 'Recycle Bin';  Counter = 'RecycleSkipped' }
-        )
+    # The per-stage Skipped counters are authoritative, so this section is built
+    # from them rather than from the note list. Otherwise a run where every skip
+    # was an expected lock would report nothing at all, which is the opposite of
+    # the truth.
+    $stageOrder = @(
+        @{ Label = 'User TEMP';    Counter = 'UserTempFilesSkipped' },
+        @{ Label = 'Windows TEMP'; Counter = 'WinTempFilesSkipped' },
+        @{ Label = 'Recycle Bin';  Counter = 'RecycleSkipped' }
+    )
 
-        foreach ($stage in $stageOrder) {
-            $prefix = '[WARN] ' + $stage.Label + ':'
-            $listedCount = 0
-            foreach ($w in $warnList) {
-                if (([string]$w).StartsWith($prefix, [System.StringComparison]::Ordinal)) { $listedCount++ }
-            }
-            $counterValue = [int](Get-PMReportValue -InputObject $Result -Name $stage.Counter -Default 0)
-            $total = [Math]::Max($counterValue, $listedCount)
-            if ($total -gt 0) {
-                $rows.Add(@('FIELD', $stage.Label, "$total file(s) left untouched."))
-            }
+    $openedSkipped = $false
+    foreach ($stage in $stageOrder) {
+        $prefix = '[WARN] ' + $stage.Label + ':'
+        $listedCount = 0
+        foreach ($w in $warnList) {
+            if (([string]$w).StartsWith($prefix, [System.StringComparison]::Ordinal)) { $listedCount++ }
         }
+        $counterValue = [int](Get-PMReportValue -InputObject $Result -Name $stage.Counter -Default 0)
+        $total = [Math]::Max($counterValue, $listedCount)
+        if ($total -gt 0) {
+            if (-not $openedSkipped) { $rows.Add(@('SECTION', 'SKIPPED')); $openedSkipped = $true }
+            $rows.Add(@('FIELD', $stage.Label, "$total file(s) left untouched."))
+        }
+    }
 
+    # Locks are the normal case and are summarised in one line, because there is
+    # nothing for the user to do about them.
+    $inUse = [int](Get-PMReportValue -InputObject $Result -Name 'SkipInUse' -Default 0)
+    if ($inUse -gt 0) {
+        if (-not $openedSkipped) { $rows.Add(@('SECTION', 'SKIPPED')); $openedSkipped = $true }
+        $rows.Add(@('DETAIL', "$inUse of those were held open by a running process. They are swept on the next run or after a restart."))
+    }
+
+    # Only reasons that may need a human are listed here.
+    if ($warnList.Count -gt 0) {
         $rows.Add(@('DETAILHEAD', 'Details:'))
         foreach ($w in $warnList) { $rows.Add(@('WARN', [string]$w)) }
     }
@@ -464,19 +478,60 @@ function Format-PMCleanupReport {
             'SUBTITLE'   { $out.Add(('  ' + $row[1])) }
             'SECTION'    { $out.Add(''); $out.Add($row[1]) }
             'FIELD'      { $out.Add(('  {0,-18}: {1}' -f $row[1], $row[2])) }
+            'DETAIL'     { $out.Add(('    ' + $row[1])) }
             'DETAILHEAD' { $out.Add(''); $out.Add(('    ' + $row[1])) }
             'WARN'       { $out.Add(('    ' + $row[1])) }
         }
     }
 
+
     $out.ToArray()
+}
+
+function Get-PMSkipCategory {
+    <#
+    .SYNOPSIS
+        Buckets a real exception message into a short reason code.
+    .DESCRIPTION
+        A TEMP sweep skips files for two very different kinds of reason, and
+        lumping them together is what turns a normal run into a wall of noise.
+
+        A file held open by a running process is the expected case, not a
+        failure. It will be swept on the next run, or cleared by a reboot, and
+        there is nothing the user can or should do about it right now. So it is
+        counted and summarised in one line instead of being listed per file.
+
+        Everything else - denied, and genuinely unclassified - is listed, because
+        those may need a human. The category is derived from the exception text
+        only; no cause is invented, and an unrecognised message is never
+        quietly folded into the expected bucket.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return 'unknown' }
+    if ($Message -match 'used by another process|cannot access the file|sharing violation|lock violation|cannot access') {
+        return 'in-use'
+    }
+    # Win32 surfaces this for TEMP entries that are mapped or in flight. It is
+    # the same practical outcome as a locked file: it stays, and it is harmless.
+    if ($Message -match 'system call level is not correct|wrong software|incorrect function') {
+        return 'in-use'
+    }
+    if ($Message -match 'access is denied|Access denied|permission denied|Permission denied') {
+        return 'denied'
+    }
+    return 'other'
 }
 
 function Invoke-PMCleanup {
     [CmdletBinding()]
     param(
-        [switch]$DryRun
+        [switch]$DryRun,
+        # Optional per-item progress sink, invoked with
+        # @{ Stage; StageCount; Index; Total; Label } as a hashtable.
+        [scriptblock]$Progress
     )
+
 
     # The first five keys are the original public contract and keep their exact
     # names, order and meaning. Everything below them is additive reporting.
@@ -510,9 +565,18 @@ function Invoke-PMCleanup {
         TotalCleaned = 0
         DryRun       = [bool]$DryRun
 
+        # Skips split by reason. SkipInUse is the expected bucket: a file held
+        # open by a running process, which is swept next run or after a restart.
+        # SkipActionable is everything else, i.e. what may need a human.
+        SkipInUse      = 0
+        SkipActionable = 0
+        SkipReasons    = @{}
+
         # Capped, human-readable failure notes. Text is the real exception
-        # message; no failure reason is inferred or invented.
+        # message; no failure reason is inferred or invented. Expected locks are
+        # counted in SkipInUse and deliberately not listed here.
         Warnings = @()
+
     }
 
     $totalCleaned = 0
@@ -534,6 +598,32 @@ function Invoke-PMCleanup {
     [long]$warningTotal = 0
     $warnLimit = 15
 
+    # Skips are bucketed by reason so a normal run does not print one line per
+    # locked file. Only reasons that may need a human are listed verbatim.
+    $skipsByReason = @{}
+    $listedByReason = @{}
+
+    # Single place where a skip is recorded, so the counters, the buckets and
+    # the capped warning list can never drift apart.
+    $recordSkip = {
+        param([string]$Stage, [string]$Name, [string]$Reason)
+        $category = Get-PMSkipCategory -Message $Reason
+        if (-not $skipsByReason.ContainsKey($category)) { $skipsByReason[$category] = 0 }
+        $skipsByReason[$category]++
+        $warningTotal++
+        if ($category -eq 'in-use') { return }
+        if (-not $listedByReason.ContainsKey($category)) { $listedByReason[$category] = 0 }
+        if ($listedByReason[$category] -ge $warnLimit) { return }
+        $listedByReason[$category]++
+        $warnings.Add("[WARN] $Stage`: '$Name' - $Reason")
+    }
+
+    $reportProgress = {
+        param([int]$Stage, [int]$StageCount, [int]$Index, [int]$Total, [string]$Label)
+        if ($null -ne $Progress) { & $Progress @{ Stage = $Stage; StageCount = $StageCount; Index = $Index; Total = $Total; Label = $Label } }
+    }
+
+
     # --- User TEMP ---
     $userTemp = $env:TEMP
     if ($userTemp -and (Test-Path $userTemp)) {
@@ -550,20 +640,22 @@ function Invoke-PMCleanup {
             $cleaned = if ($before) { $before } else { 0 }
             $uAfter = $uBefore
         } else {
+            $uTotal = @($tree.Files).Count
+            $uIndex = 0
             foreach ($file in $tree.Files) {
+                $uIndex++
                 try {
                     Send-FileToRecycleBin -LiteralPath $file.FullName
                     $uRecycled++
                 } catch {
                     $skipped++
                     $uSkipped++
-                    $warningTotal++
-                    if ($warnings.Count -lt $warnLimit) {
-                        $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                        $warnings.Add("[WARN] User TEMP: '$($file.Name)' - $reason")
-                    }
+                    $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                    & $recordSkip 'User TEMP' $file.Name $reason
                 }
+                & $reportProgress 1 3 $uIndex $uTotal 'User TEMP'
             }
+            & $reportProgress 1 3 $uTotal $uTotal 'User TEMP'
 
             # Remove empty dirs (deepest first). Reparse points were never
             # collected, so they can never be removed here.
@@ -574,6 +666,7 @@ function Invoke-PMCleanup {
                     }
                 } catch {}
             }
+
 
             $after = Get-DirectorySize -Path $userTemp
             $uAfter = if ($null -ne $after) { [long]$after } else { [long]0 }
@@ -602,22 +695,25 @@ function Invoke-PMCleanup {
             $cleaned = if ($before) { $before } else { 0 }
             $wAfter = $wBefore
         } else {
+            $wTotal = @($tree.Files).Count
+            $wIndex = 0
             foreach ($file in $tree.Files) {
+                $wIndex++
                 try {
                     Send-FileToRecycleBin -LiteralPath $file.FullName
                     $wRecycled++
                 } catch {
                     $skipped++
                     $wSkipped++
-                    $warningTotal++
-                    if ($warnings.Count -lt $warnLimit) {
-                        $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                        $warnings.Add("[WARN] Windows TEMP: '$($file.Name)' - $reason")
-                    }
+                    $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                    & $recordSkip 'Windows TEMP' $file.Name $reason
                 }
+                & $reportProgress 2 3 $wIndex $wTotal 'Windows TEMP'
             }
+            & $reportProgress 2 3 $wTotal $wTotal 'Windows TEMP'
 
             $after = Get-DirectorySize -Path $winTemp
+
             $wAfter = if ($null -ne $after) { [long]$after } else { [long]0 }
             $cleaned = if ($before -gt $after) { $before - $after } else { 0 }
         }
@@ -640,7 +736,10 @@ function Invoke-PMCleanup {
     $rbCleanedBytes = 0
 
     if (-not $DryRun) {
+        $rbTotal = @($rbCleanable).Count
+        $rbIndex = 0
         foreach ($item in $rbCleanable) {
+            $rbIndex++
             try {
                 Remove-RecycleBinItemPermanently -LiteralPath $item.InternalPath
                 $rbCleanedBytes += $item.Size
@@ -648,16 +747,16 @@ function Invoke-PMCleanup {
             } catch {
                 $skipped++
                 $rbPurgeFailed++
-                $warningTotal++
-                if ($warnings.Count -lt $warnLimit) {
-                    $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                        $warnings.Add("[WARN] Recycle Bin: '$($item.Name)' - $reason")
-                }
+                $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                & $recordSkip 'Recycle Bin' $item.Name $reason
             }
+            & $reportProgress 3 3 $rbIndex $rbTotal 'Recycle Bin'
         }
+        & $reportProgress 3 3 $rbTotal $rbTotal 'Recycle Bin'
     } else {
         $rbCleanedBytes = ($rbCleanable | Measure-Object -Property Size -Sum -ErrorAction SilentlyContinue).Sum
     }
+
 
     if ($null -ne $rbCleanedBytes) { $rbCleanedBytes = [long]$rbCleanedBytes } else { $rbCleanedBytes = [long]0 }
 
@@ -672,9 +771,19 @@ function Invoke-PMCleanup {
     $summary.RecycleSkipped         = $rbPurgeFailed
     $summary.TotalCleaned           = [long]$totalCleaned
 
-    if ($warningTotal -gt $warnings.Count) {
-        $warnings.Add("[WARN] ... and $($warningTotal - $warnings.Count) more failure(s) not listed.")
+    # Locks are not failures, so they are excluded from the "not listed"
+    # overflow note. Otherwise a busy machine would report a pile of unlisted
+    # failures that were never failures to begin with.
+    $inUse = if ($skipsByReason.ContainsKey('in-use')) { [long]$skipsByReason['in-use'] } else { [long]0 }
+    $actionable = $warningTotal - $inUse
+    $summary.SkipInUse      = $inUse
+    $summary.SkipActionable = $actionable
+    $summary.SkipReasons    = $skipsByReason
+
+    if ($actionable -gt $warnings.Count) {
+        $warnings.Add("[WARN] ... and $($actionable - $warnings.Count) more failure(s) not listed.")
     }
+
     # .ToArray(), not @($warnings): on Windows PowerShell 5.1 @() around a List
     # yields a one-element array holding the List, so the WARNINGS section would
     # print the collection object instead of the individual warning rows.
@@ -821,13 +930,40 @@ function Invoke-TempCleanerUI {
     # ---------------------------------------------------------------- cleanup
     Write-Host ""
     Write-Host "  Running cleanup..." -ForegroundColor DarkGray
-    Write-TCField 'User TEMP'     'Cleaning...'
-    Write-TCField 'Windows TEMP'  'Cleaning...'
-    Write-TCField 'Recycle Bin'   'Cleaning...'
+
+    # Real per-item progress. The three "Cleaning..." lines used to be printed
+    # up front, before any work started, so the screen claimed to be busy while
+    # nothing had happened yet. $script:TCProgressInPlace keeps the bar on one
+    # line on a real console, and falls back to plain lines when the output is
+    # redirected to a file or a pipe.
+    $script:TCProgressInPlace = ([Environment]::UserInteractive -and -not [Console]::IsOutputRedirected)
+    $tcStageStart = [datetime]::Now
+    $tcProgress = {
+        param($State)
+        $total = [int]$State.Total
+        $index = [int]$State.Index
+        if ($total -gt 0) { $ratio = [double]$index / [double]$total } else { $ratio = 1.0 }
+        $barWidth = 24
+        $filled = [int][math]::Floor($ratio * $barWidth)
+        if ($filled -lt 1 -and $index -gt 0) { $filled = 1 }
+        $bar = ('#' * $filled) + ('.' * ($barWidth - $filled))
+        $pct = [int][math]::Round($ratio * 100)
+        $elapsed = [int]([datetime]::Now - $tcStageStart).TotalSeconds
+        $text = '  Clean {0}/{1}  [{2}] {3,3}%  {4}  {5}s' -f `
+            $State.Stage, $State.StageCount, $bar, $pct, $State.Label, $elapsed
+        if ($script:TCProgressInPlace) {
+            Write-Host ("$([char]27)[1G$([char]27)[0K$text") -NoNewline
+        } else {
+            Write-Host $text
+        }
+    }
 
     $cleanupResult = $null
     $cleanupError  = $null
-    try { $cleanupResult = Invoke-PMCleanup } catch { $cleanupError = $_ }
+    try { $cleanupResult = Invoke-PMCleanup -Progress $tcProgress } catch { $cleanupError = $_ }
+    # Close the in-place line so the result table starts on a clean row.
+    if ($script:TCProgressInPlace) { Write-Host '' }
+
 
     if ($cleanupResult) {
         Write-Host ""

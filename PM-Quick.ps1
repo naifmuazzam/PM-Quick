@@ -31,7 +31,11 @@
 [CmdletBinding()]
 param(
     # Write the collected data to a local JSON file. Local only, no upload.
-    [string]$Json
+    [string]$Json,
+
+    # Suppress the end-of-run Y/N export offer. Used by the validation harness,
+    # where stdin is redirected and a prompt would never be answered.
+    [switch]$NoExportPrompt
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -478,10 +482,106 @@ if ($summary) {
 # ============================================================================
 # OPTIONAL LOCAL JSON EXPORT
 # ============================================================================
-# Tracked so the footer can stay truthful. An unconditional "nothing was
-# changed" would be a false claim in exactly the mode that writes a file.
+# Offered at the end, because that is the moment the user knows whether they
+# want the file. -Json still writes directly and skips the question.
+#
+# Consent rule, identical to the cleaner's destructive gate: only a literal
+# Y/y or N/n is an answer. A bare Enter is not an answer. Someone leaning on the
+# key must not be able to create a file by accident, so Enter re-prompts instead
+# of defaulting to yes.
 $exportedReport = $null
-$exportAttempted = [bool]$Json
+$exportFailed = $false
+$exportDeclined = $false
+
+function Get-PMExportDecision {
+    # Total and side-effect free: returns the decision, never infers one.
+    param([AllowNull()][AllowEmptyString()][string]$Answer)
+
+    if ($null -eq $Answer) { return 'RETRY' }
+    $normalized = $Answer.Trim()
+    if ($normalized.Length -eq 0) { return 'RETRY' }
+    if ($normalized -ceq 'Y' -or $normalized -ceq 'y') { return 'YES' }
+    if ($normalized -ceq 'N' -or $normalized -ceq 'n') { return 'NO' }
+    return 'RETRY'
+}
+
+function Request-PMExportDecision {
+    <#
+    .SYNOPSIS
+        Asks whether to save the report, and refuses to guess.
+    .DESCRIPTION
+        The reader is injected so the consent rule can be tested without a
+        console. Only a literal Y/y or N/n ends the exchange. A bare Enter -
+        what happens when someone leans on the key - re-prompts and is never
+        read as consent, so no file can be created by accident.
+
+        Two escape hatches keep this from ever trapping the console:
+          - the reader throwing (Ctrl+C, or the window being closed) returns NO
+          - a bounded attempt count falls back to NO, because skipping an
+            optional file is always the safe outcome
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$Read,
+        [int]$MaxAttempts = 20
+    )
+
+    $decision = 'RETRY'
+    $attempts = 0
+    while ($decision -eq 'RETRY' -and $attempts -lt $MaxAttempts) {
+        $attempts++
+        $answer = $null
+        try {
+            $answer = & $Read
+        } catch {
+            return 'NO'
+        }
+        $decision = Get-PMExportDecision -Answer $answer
+        if ($decision -eq 'RETRY' -and $attempts -lt $MaxAttempts) {
+            Write-Host "  Enter is not an answer. Type Y to save, N to skip." -ForegroundColor DarkGray
+        }
+    }
+    if ($decision -eq 'RETRY') { return 'NO' }
+    return $decision
+}
+
+if (-not $Json) {
+    # Never prompt when there is no human there to answer. A redirected stdin
+    # returns EOF forever and would spin, so the offer is skipped outright.
+    $canPrompt = (-not $NoExportPrompt) -and
+                 [Environment]::UserInteractive -and
+                 (-not [Console]::IsInputRedirected)
+
+    if ($canPrompt) {
+        Write-Host ""
+        Write-Host "  Save this report as a local JSON file? [Y/N]" -ForegroundColor Cyan
+        Write-Host "  Press Enter to skip. Nothing is written unless you type Y." -ForegroundColor DarkGray
+
+        $decision = Request-PMExportDecision -Read { Read-Host '  Export JSON? [Y/N]' }
+
+        if ($decision -eq 'YES') {
+            $defaultName = 'pm-quick-{0}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss')
+            $typed = $null
+            try {
+                $typed = Read-Host "  File name [$defaultName]"
+            } catch {
+                # Interrupted at the name prompt: no file, no error spew.
+                $typed = $null
+            }
+            if ([string]::IsNullOrWhiteSpace($typed)) { $typed = $defaultName }
+            # Refuse a name that would escape the output directory. A report is
+            # not worth letting a stray .. or an absolute path redirect the write.
+            if ($typed -match '[\/:*?"<>|]' -or $typed -match '^\s*\.\.?\s*$') {
+                Write-Host "  '$typed' is not a usable file name. Nothing was written." -ForegroundColor Red
+                $exportFailed = $true
+            } else {
+                $Json = $typed
+            }
+        } else {
+            $exportDeclined = $true
+        }
+    }
+}
 
 if ($Json) {
     try {
@@ -496,6 +596,7 @@ if ($Json) {
         Write-Host "  Report saved locally: $saved" -ForegroundColor Green
         Write-Host "  (local file only - nothing was uploaded)" -ForegroundColor DarkGray
     } catch {
+        $exportFailed = $true
         Write-Host ""
         Write-Host "  Could not write JSON report: $($_.Exception.Message)" -ForegroundColor Red
     }
@@ -504,19 +605,19 @@ if ($Json) {
 # ============================================================================
 # FOOTER
 # ============================================================================
+# States what actually happened. An unconditional "nothing was changed" would be
+# a false claim in the one mode that does write a file.
 Write-Host ""
 Write-Host "  ========================================" -ForegroundColor Cyan
 Write-Host "  Read-only report complete." -ForegroundColor DarkGray
 if ($exportedReport) {
-    # One file was written, by request. Say so rather than claiming otherwise.
     Write-Host "  No existing file, setting or data was changed, and" -ForegroundColor DarkGray
     Write-Host "  nothing was deleted or uploaded. The only file written" -ForegroundColor DarkGray
-    Write-Host "  was the report you requested:" -ForegroundColor DarkGray
+    Write-Host "  was the report you saved on request:" -ForegroundColor DarkGray
     Write-Host "    $exportedReport" -ForegroundColor DarkGray
-} elseif ($exportAttempted) {
-    Write-Host "  Nothing was changed, deleted or uploaded, but the" -ForegroundColor DarkGray
-    Write-Host "  requested JSON export FAILED, so no report file was" -ForegroundColor DarkGray
-    Write-Host "  written." -ForegroundColor DarkGray
+} elseif ($exportFailed) {
+    Write-Host "  Nothing was changed, deleted or uploaded. The JSON export" -ForegroundColor DarkGray
+    Write-Host "  did not succeed, so no report file was written." -ForegroundColor DarkGray
 } else {
     Write-Host "  Nothing was changed, deleted or uploaded." -ForegroundColor DarkGray
 }

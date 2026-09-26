@@ -276,13 +276,13 @@ Stage A
 User TEMP
     |
     v
-Recycle Bin
+Permanent delete
 
 Stage B
 Windows TEMP
     |
     v
-Recycle Bin
+Permanent delete
 
 Stage C
 Recycle Bin
@@ -297,15 +297,16 @@ Only TEMP-origin items
 Permanent purge
 ```
 
-**Stage A and B** delete TEMP files outright. They used to be recycled first,
-but that was not a safety net: Stage C purges TEMP-origin items in the same run, so
-the Recycle Bin never really kept them. It only cost time, because moving a
-file into the Recycle Bin spends about a second discovering that a file held
-open by another process cannot be moved, while deleting it outright fails in
+Stages A and B never touch the Recycle Bin. They used to recycle each file
+first, but that was not a safety net: Stage C purges TEMP-origin items in the
+same run, so the Recycle Bin never really kept them. It only cost time, because
+moving a file into the Recycle Bin spends about a second discovering that a file
+held open by another process cannot be moved, while deleting it outright fails in
 about twenty milliseconds. It also made the preview's purge count wrong, since
 the run kept adding the very items the preview had already counted.
-**Stage C** still purges only the Recycle Bin items whose recorded original path
-lies inside a known TEMP root.
+
+Stage C is the only stage that reads the Recycle Bin, and it purges only items
+whose recorded original path lies inside a known TEMP root.
 
 Guarantees:
 
@@ -441,11 +442,11 @@ entry point is guarded by an `if ($MyInvocation.InvocationName -ne '.')` check.
 
 Real constraints discovered during development.
 
-- **Recycle Bin quota.** Windows may permanently delete a file at the moment it
-  is sent to the Recycle Bin if that file exceeds the Recycle Bin or volume
-  quota. Temp-Cleaner does not override operating-system Recycle Bin policy and
-  cannot guarantee that any individual file remains recoverable. Stage C is
-  restricted to TEMP-origin items for exactly this reason.
+- **Recycle Bin quota affects items the user deleted, not this tool.** Temp-Cleaner
+  no longer sends anything to the Recycle Bin, so it cannot lose a file to the
+  operating system's quota or volume limit. Stage C only ever *removes* existing
+  items, and only TEMP-origin ones. Items the technician deleted by hand remain
+  subject to normal Windows Recycle Bin behaviour.
 - **Locked files are never force-deleted.** Files held by running services stay
   in TEMP until released.
 - **GPU VRAM is often `N/A`.** `Win32_VideoController.AdapterRAM` is a signed
@@ -487,10 +488,10 @@ powershell -ExecutionPolicy Bypass -NoProfile -File D:\myProjects\_pm-quick-vali
 
 | Suite | Script | Scope | Result |
 |---|---|---|---|
-| P1a function parity | `Test-Function-Parity.ps1` | Destructive code moved from the frozen baseline unchanged | 43 pass / 0 fail |
+| P1a function parity | `Test-Function-Parity.ps1` | Destructive code moved from the frozen baseline unchanged | 45 pass / 0 fail |
 | P1b runtime read-only | `Test-Runtime-ReadOnly.ps1` | Runs PM-Quick and proves it changes nothing on disk | 45 pass / 0 fail |
-| P2 sandboxed cleanup | `Test-Sandboxed-Cleanup.ps1` | Cleaner works, and its guards refuse bad input | 82 pass / 0 fail |
-| P3 information modules | `Modules-Contract.ps1` | All eight modules load, collectors work, fields exist | 309 pass / 0 fail |
+| P2 sandboxed cleanup | `Test-Sandboxed-Cleanup.ps1` | Cleaner works, and its guards refuse bad input | 122 pass / 0 fail |
+| P3 information modules | `Modules-Contract.ps1` | All eight modules load, collectors work, fields exist | 318 pass / 0 fail |
 | P4 read-only audit | `Tests-ReadOnly-Audit.ps1` | PM-Quick contains no destructive path, no duplicates | 32 pass / 0 fail |
 | | | **Total** | **562 pass / 0 fail** |
 

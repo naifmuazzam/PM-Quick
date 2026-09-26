@@ -70,12 +70,13 @@ function Get-PMHealthCheck {
             $firmware = if ($tpm.ManufacturerVersionFull20) { $tpm.ManufacturerVersionFull20 } else { 'unknown firmware' }
             $specVer  = if ($null -ne $tpm.SpecVersion) { $tpm.SpecVersion } else { 'unknown spec version' }
 
-            # Win32_Tpm spells its state properties three different ways across
-            # builds, and a name that does not exist reads as $null rather than
-            # failing, so a single wrong guess silently reported a healthy TPM as
-            # broken. All three are tried, live names first, and the
-            # _InitialValue forms last: those record the state at boot, which is
-            # the value in force until the next restart.
+            # Win32_Tpm exposes exactly eight properties, and the enabled and
+            # activated states are only among them as the _InitialValue forms.
+            # IsEnabled and IsActivated are METHODS on the class, not properties,
+            # so reading them as properties yields $null on every build and used
+            # to be reported as a disabled TPM. The documented property is tried
+            # first; the two undocumented spellings remain only as a courtesy to
+            # OEM classes that extend it.
             $toBool = {
                 param($v)
                 if ($null -eq $v) { return $null }
@@ -98,8 +99,8 @@ function Get-PMHealthCheck {
                 return $null
             }
 
-            $enabledHit   = & $readFlag $tpm @('IsEnabled_', 'IsEnabled', 'IsEnabled_InitialValue')
-            $activatedHit = & $readFlag $tpm @('IsActivated_', 'IsActivated', 'IsActivated_InitialValue')
+            $enabledHit   = & $readFlag $tpm @('IsEnabled_InitialValue', 'IsEnabled_', 'IsEnabled')
+            $activatedHit = & $readFlag $tpm @('IsActivated_InitialValue', 'IsActivated_', 'IsActivated')
 
             if (-not $enabledHit -and -not $activatedHit) {
                 $seen = @($tpm.PSObject.Properties.Name | Where-Object { $_ -like 'Is*' }) -join ', '
@@ -110,7 +111,11 @@ function Get-PMHealthCheck {
                 $activated = [bool]$activatedHit.Value
                 $atBoot = (($enabledHit -and $enabledHit.Name -like '*_InitialValue') -or
                            ($activatedHit -and $activatedHit.Name -like '*_InitialValue'))
-                $bootNote = if ($atBoot) { ' (state recorded at boot)' } else { '' }
+                # Microsoft documents the _InitialValue forms as a value stored
+                # when the WMI class is instantiated, not a live hardware read;
+                # a live reading needs the IsEnabled/IsActivated methods. Saying
+                # so is better than implying a live reading we did not take.
+                $bootNote = if ($atBoot) { ' (state as of this class query; a live reading needs the IsEnabled/IsActivated methods)' } else { '' }
 
                 # The detail is derived from the flags, because a fixed
                 # "is enabled and activated" printed next to a Warning status is
